@@ -1,0 +1,7 @@
+generated_code/
+outputs/
+uploads/
+__pycache__/
+*.pyc
+*.pyo
+.env
