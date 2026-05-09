@@ -126,7 +126,8 @@ def _reconstruct_session(session_id: str) -> dict | None:
         "graph": _shared_graph,
         "config": config,
         "state": create_initial_state(
-            meta["dataset_path"], meta["task_type"], meta.get("target_column")
+            meta["dataset_path"], meta["task_type"], meta.get("target_column"),
+            session_id=session_id,
         ),
         "events_queue": asyncio.Queue(),
         "seen_events": len(last_state.get("events", [])),
@@ -294,7 +295,7 @@ async def start_pipeline(body: StartRequest):
     _save_session_meta(session_id, dataset_path, body.task_type, body.target_column)
 
     config = {"configurable": {"thread_id": session_id}}
-    initial_state = create_initial_state(dataset_path, body.task_type, body.target_column)
+    initial_state = create_initial_state(dataset_path, body.task_type, body.target_column, session_id=session_id)
     queue: asyncio.Queue = asyncio.Queue()
 
     sessions[session_id] = {
@@ -403,7 +404,7 @@ async def get_code(session_id: str, step: str):
 @app.get("/download/{session_id}/model")
 async def download_model(session_id: str):
     _get_session(session_id)
-    model_path = OUTPUTS_DIR / "model.pkl"
+    model_path = OUTPUTS_DIR / session_id / "model.pkl"
     if not model_path.exists():
         raise HTTPException(status_code=404, detail="Model not yet trained.")
     return FileResponse(str(model_path), filename="model.pkl", media_type="application/octet-stream")
@@ -412,13 +413,18 @@ async def download_model(session_id: str):
 @app.get("/outputs/{session_id}/plots")
 async def list_plots(session_id: str):
     _get_session(session_id)
-    return {"plots": [p.name for p in OUTPUTS_DIR.glob("*.png")]}
+    plots_dir = OUTPUTS_DIR / session_id / "plots"
+    if not plots_dir.exists():
+        return {"plots": []}
+    return {"plots": [p.name for p in plots_dir.glob("*.png")]}
 
 
 @app.get("/outputs/{session_id}/plot/{filename}")
 async def get_plot(session_id: str, filename: str):
     _get_session(session_id)
-    path = OUTPUTS_DIR / filename
-    if not path.exists() or not filename.endswith(".png"):
+    if not filename.endswith(".png"):
+        raise HTTPException(status_code=400, detail="Only PNG files supported.")
+    path = OUTPUTS_DIR / session_id / "plots" / filename
+    if not path.exists():
         raise HTTPException(status_code=404, detail="Plot not found.")
     return FileResponse(str(path), media_type="image/png")

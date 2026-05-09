@@ -436,6 +436,7 @@ def generate_optimization_code(
     best_model: dict,
     human_feedback: str = "",
     last_working_code: str = "",
+    session_id: str = "",
 ) -> str:
     """Return code string for the given iteration."""
     algo = strategy["algorithm"]
@@ -443,7 +444,9 @@ def generate_optimization_code(
     hyperparams = json.dumps(strategy.get("hyperparameters", {}))
     search_space = json.dumps(strategy.get("search_space", {}))
     reason = strategy.get("reason", "")
-    model_path = str(OUTPUTS_DIR / f"model_iter{iteration}.pkl")
+    session_out = OUTPUTS_DIR / (session_id if session_id else "default")
+    session_out.mkdir(parents=True, exist_ok=True)
+    model_path = str(session_out / f"model_iter{iteration}.pkl")
     stratify = "stratify=y, " if "classif" in task_type else ""
     scale = _scale_needed(algo)
     scoring = _scoring_metric(task_type)
@@ -684,6 +687,7 @@ def run(
     tried_algorithms: list = None,
     last_working_code: str = "",
     current_algorithm: str = "",
+    session_id: str = "",
 ) -> dict:
     """Determine strategy from counters, generate code, write it, return metadata dict."""
     strategy = select_next_strategy(
@@ -706,6 +710,7 @@ def run(
         dataset_path, task_type, target_column,
         iteration, strategy, optimization_history, best_model, human_feedback,
         last_working_code=last_working_code if strategy.get("strategy") == "tune_best" else "",
+        session_id=session_id,
     )
 
     script_name = f"step3_ml_iter{iteration}.py"

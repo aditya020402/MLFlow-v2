@@ -356,8 +356,10 @@ def _upload_and_summarise(
     model_link      = ""
     history_link    = ""
 
+    session_out = OUTPUTS_DIR / session_id
+
     # Upload model.pkl
-    model_path = OUTPUTS_DIR / "model.pkl"
+    model_path = session_out / "model.pkl"
     if model_path.exists():
         try:
             up = client.upload_file(model_path)
@@ -366,7 +368,7 @@ def _upload_and_summarise(
             logger.warning("model.pkl upload failed: %s", exc)
 
     # Upload optimization_history.json
-    hist_path = OUTPUTS_DIR / "optimization_history.json"
+    hist_path = session_out / "optimization_history.json"
     if hist_path.exists():
         try:
             up = client.upload_file(hist_path)

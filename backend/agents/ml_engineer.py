@@ -170,12 +170,15 @@ def generate_ml_code(
     understanding_output: str,
     analysis_output: str,
     human_feedback: str = "",
+    session_id: str = "",
 ) -> str:
     """Generate step3_ml.py (baseline / iteration-0 model)."""
     algo = algorithm_info["algorithm"]
     hyperparams = json.dumps(algorithm_info.get("hyperparameters", {}))
     reason = algorithm_info.get("reason", "")
-    model_path = str(OUTPUTS_DIR / "model_iter0.pkl")
+    session_out = OUTPUTS_DIR / (session_id if session_id else "default")
+    session_out.mkdir(parents=True, exist_ok=True)
+    model_path = str(session_out / "model_iter0.pkl")
     stratify = "stratify=y, " if "classif" in task_type else ""
     scale = "Regressor" in algo or "SV" in algo or "Logistic" in algo or "Ridge" in algo or "Linear" in algo
 
@@ -298,6 +301,7 @@ def run(
     analysis_output: str,
     human_feedback: str = "",
     tried_algorithms: list = None,
+    session_id: str = "",
 ) -> dict:
     """Generate baseline ML code, write it, return metadata dict."""
     algorithm_info = select_algorithm(
@@ -313,6 +317,7 @@ def run(
     code = generate_ml_code(
         dataset_path, task_type, target_column,
         algorithm_info, understanding_output, analysis_output, human_feedback,
+        session_id=session_id,
     )
     script_path = GENERATED_CODE_DIR / "step3_ml.py"
     script_path.write_text(code)

@@ -55,7 +55,8 @@ _checkpointer = SqliteSaver(_conn)
 
 class PipelineState(TypedDict):
     # ── Inputs ──
-    dataset_path: str
+    session_id: str
+    dataset_path: str       # updated to cleaned CSV path after data analysis
     task_type: str          # supervised_classification | supervised_regression | unsupervised
     target_column: Optional[str]
 
@@ -209,6 +210,7 @@ def node_data_analysis(state: PipelineState) -> PipelineState:
         understanding_output=state["understanding_output"],
         task_type=state["task_type"],
         target_column=state.get("target_column"),
+        session_id=state.get("session_id", ""),
     )
 
     events = _emit({"events": events}, "code_generated", "step2_analysis.py written.", data=result["code"])
@@ -234,7 +236,25 @@ def node_execute_analysis(state: PipelineState) -> PipelineState:
             events = _emit({"events": events}, "analysis_data", "Analysis results ready.", data=analysis_data)
         events = _emit({"events": events}, "awaiting_approval",
                        "Analysis complete. Awaiting human approval to proceed to modeling.")
-        return {**state, "analysis_output": result.stdout, "analysis_error": "", "status": "awaiting_approval", "events": events}
+
+        # Extract cleaned CSV path emitted by the analysis script
+        cleaned_path = state["dataset_path"]
+        for line in result.stdout.splitlines():
+            if line.startswith("CLEANED_CSV:"):
+                candidate = line[len("CLEANED_CSV:"):].strip()
+                if candidate and Path(candidate).exists():
+                    cleaned_path = candidate
+                    logger.info("Using cleaned dataset: %s", cleaned_path)
+                break
+
+        return {
+            **state,
+            "dataset_path":   cleaned_path,
+            "analysis_output": result.stdout,
+            "analysis_error":  "",
+            "status":          "awaiting_approval",
+            "events":          events,
+        }
 
     events = _emit({"events": events}, "execution_error", f"step2 failed after {MAX_RETRIES} retries.", data=result.stderr)
     return {**state, "analysis_output": "", "analysis_error": result.stderr, "status": "failed", "events": events}
@@ -264,6 +284,7 @@ def node_ml_engineering(state: PipelineState) -> PipelineState:
         analysis_output=state["analysis_output"],
         human_feedback=state.get("human_feedback", ""),
         tried_algorithms=current_tried,
+        session_id=state.get("session_id", ""),
     )
 
     algo_info = result["algorithm_info"]
@@ -400,6 +421,7 @@ def node_optimizer(state: PipelineState) -> PipelineState:
         tried_algorithms=current_tried,
         last_working_code=state.get("last_opt_working_code", ""),
         current_algorithm=state.get("current_algorithm", ""),
+        session_id=state.get("session_id", ""),
     )
 
     algo_info = result["algorithm_info"]
@@ -486,8 +508,11 @@ def node_finalize_best(state: PipelineState) -> PipelineState:
 
     events = _emit(state, "agent_thinking", "Finalizing best model across all iterations...")
 
-    best_path = best.get("model_path", "")
-    final_path = str(OUTPUTS_DIR / "model.pkl")
+    session_out = OUTPUTS_DIR / (state.get("session_id") or "default")
+    session_out.mkdir(parents=True, exist_ok=True)
+
+    best_path  = best.get("model_path", "")
+    final_path = str(session_out / "model.pkl")
 
     if best_path and Path(best_path).exists():
         shutil.copy2(best_path, final_path)
@@ -495,7 +520,7 @@ def node_finalize_best(state: PipelineState) -> PipelineState:
     else:
         logger.warning("Best model path not found: %s", best_path)
 
-    history_path = OUTPUTS_DIR / "optimization_history.json"
+    history_path = session_out / "optimization_history.json"
     history_path.write_text(json.dumps(history, indent=2, default=str))
 
     summary_lines = [
@@ -654,9 +679,10 @@ graph = build_graph()
 
 
 def create_initial_state(
-    dataset_path: str, task_type: str, target_column: str = None
+    dataset_path: str, task_type: str, target_column: str = None, session_id: str = ""
 ) -> PipelineState:
     return PipelineState(
+        session_id=session_id,
         dataset_path=dataset_path,
         task_type=task_type,
         target_column=target_column,

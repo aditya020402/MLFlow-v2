@@ -6,10 +6,11 @@ from openai import OpenAI
 logger = logging.getLogger(__name__)
 
 GENERATED_CODE_DIR = Path(__file__).parent.parent / "generated_code"
-OUTPUTS_DIR = Path(__file__).parent.parent / "outputs"
+OUTPUTS_DIR        = Path(__file__).parent.parent / "outputs"
+UPLOADS_DIR        = Path(__file__).parent.parent / "uploads"
 
 client = OpenAI()
-MODEL = "gpt-4o"
+MODEL  = "gpt-4o"
 
 SYSTEM_PROMPT = """You are an expert Data Analyst Agent. Your ONLY job is to write clean, executable Python code.
 
@@ -19,7 +20,7 @@ Rules:
 - Use pandas, numpy, scipy.stats — all available.
 - Print a structured JSON summary to stdout at the end: print(json.dumps(analysis, indent=2, default=str))
 - The analysis dict must include: correlations, outlier_counts, feature_insights, top_features, recommendations, preprocessing_decisions.
-- Save any plots as PNG files in the outputs/ directory using matplotlib with Agg backend (no display).
+- Save any plots as PNG files using matplotlib with Agg backend (no display).
 - Choose the most appropriate imputation strategy based on the data's distribution and skewness.
 """
 
@@ -27,8 +28,16 @@ FIX_SYSTEM_PROMPT = """You are an expert Python debugger. Fix the provided code 
 Output ONLY the complete fixed Python code. No explanations, no markdown, no backticks."""
 
 
-def generate_analysis_code(dataset_path: str, understanding_output: str, task_type: str, target_column: str = None) -> str:
-    outputs_dir = str(OUTPUTS_DIR)
+def generate_analysis_code(
+    dataset_path: str,
+    understanding_output: str,
+    task_type: str,
+    target_column: str = None,
+    session_id: str = "",
+) -> str:
+    session_key  = session_id if session_id else "default"
+    plots_dir    = str(OUTPUTS_DIR / session_key / "plots")
+    cleaned_path = str(UPLOADS_DIR / f"{session_key}_cleaned.csv")
 
     prompt = f"""Write Python code to perform exploratory data analysis on the dataset at: {dataset_path}
 
@@ -38,15 +47,24 @@ Task type: {task_type}
 Data Understanding Summary (from previous step):
 {understanding_output}
 
-The code must:
+The code must do ALL of the following in order:
+
 1. Load the full dataset using pandas (read_csv)
-2. Handle missing values intelligently:
+
+2. Create the plots directory (it may not exist yet):
+   import os
+   os.makedirs("{plots_dir}", exist_ok=True)
+
+3. Handle missing values intelligently:
    - Drop columns where >50% of values are missing
-   - For remaining columns, choose an appropriate imputation strategy based on the data:
-     * Numeric columns: use median for skewed distributions, mean for symmetric ones
-     * Categorical columns: use mode
-   - Document each imputation decision in the preprocessing_decisions dict
-3. Compute Pearson correlation for numeric column PAIRS (upper triangle only — NO self-correlations):
+   - For remaining columns:
+     * Numeric: use median for skewed distributions (|skewness| > 1), mean for symmetric
+     * Categorical/object: use mode
+   - Document each decision in preprocessing_decisions dict
+
+4. Drop exact duplicate rows (keep='first').
+
+5. Compute Pearson correlation for numeric column PAIRS (upper triangle only — NO self-correlations):
    Use EXACTLY this code pattern:
        _num_cols = df.select_dtypes(include="number").columns.tolist()
        _cmat = df[_num_cols].corr()
@@ -54,12 +72,29 @@ The code must:
        for _i in range(len(_num_cols)):
            for _j in range(_i + 1, len(_num_cols)):  # i < j guarantees no self-pair
                correlations[f"{{_num_cols[_i]}}_{{_num_cols[_j]}}"] = round(float(_cmat.iloc[_i, _j]), 4)
-4. Detect outliers using IQR method (values outside Q1-1.5*IQR to Q3+1.5*IQR)
-5. {"Analyze feature-target relationships for target column: " + target_column if target_column else "Analyze feature clusters and variance"}
-6. Generate and SAVE (do NOT show/display) the following plots to {outputs_dir}/:
+
+6. Detect outliers using IQR method (values outside Q1-1.5*IQR to Q3+1.5*IQR)
+
+7. {"Analyze feature-target relationships for target column: " + target_column if target_column else "Analyze feature clusters and variance"}
+
+8. Generate and SAVE (do NOT show/display) the following plots to {plots_dir}/:
    - correlation_heatmap.png  (seaborn heatmap or matplotlib)
    - distributions.png (histograms for top 6 numeric features)
-7. Build an analysis dict and print it: print(json.dumps(analysis, indent=2, default=str))
+
+   Use EXACTLY:
+       import matplotlib
+       matplotlib.use('Agg')
+       import matplotlib.pyplot as plt
+
+9. Save the cleaned dataframe (after missing-value handling and duplicate removal,
+   but BEFORE any label-encoding or scaling) to:
+       cleaned_path = "{cleaned_path}"
+       df.to_csv(cleaned_path, index=False)
+   Then print the marker line EXACTLY as shown (no spaces around the colon):
+       print(f"CLEANED_CSV:{{cleaned_path}}")
+
+10. Build an analysis dict and print it:
+    print(json.dumps(analysis, indent=2, default=str))
 
 The analysis dict structure:
 {{
@@ -72,11 +107,6 @@ The analysis dict structure:
   "plots_saved": ["correlation_heatmap.png", "distributions.png"]
 }}
 
-IMPORTANT: Use matplotlib with Agg backend:
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-
 Output ONLY the Python code."""
 
     response = client.chat.completions.create(
@@ -88,14 +118,13 @@ Output ONLY the Python code."""
         ],
     )
 
-    code = response.choices[0].message.content.strip()
-    code = _strip_markdown(code)
-    logger.info("Data Analyst Agent generated code.")
+    code = _strip_markdown(response.choices[0].message.content.strip())
+    logger.info("Data Analyst Agent generated code (session=%s).", session_key)
     return code
 
 
 def fix_analysis_code(current_code: str, stderr: str, stdout: str, attempt: int) -> str:
-    logger.info(f"Data Analyst Agent fixing code (attempt {attempt})...")
+    logger.info("Data Analyst Agent fixing code (attempt %d)...", attempt)
 
     prompt = f"""The following Python code failed to execute.
 
@@ -118,35 +147,37 @@ Fix the code so it runs correctly. Output ONLY the complete fixed Python code.""
             {"role": "user", "content": prompt},
         ],
     )
-
-    fixed = response.choices[0].message.content.strip()
-    fixed = _strip_markdown(fixed)
-    logger.info("Data Analyst Agent returned fix.")
-    return fixed
+    return _strip_markdown(response.choices[0].message.content.strip())
 
 
 def make_fix_callback(current_code_path: Path):
     def callback(stderr: str, stdout: str, attempt: int) -> str:
-        current_code = current_code_path.read_text()
-        return fix_analysis_code(current_code, stderr, stdout, attempt)
+        return fix_analysis_code(current_code_path.read_text(), stderr, stdout, attempt)
     return callback
 
 
 def _strip_markdown(code: str) -> str:
     if code.startswith("```"):
-        lines = code.split("\n")
-        lines = lines[1:]
+        lines = code.split("\n")[1:]
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         code = "\n".join(lines)
     return code.strip()
 
 
-def run(dataset_path: str, understanding_output: str, task_type: str, target_column: str = None) -> dict:
-    code = generate_analysis_code(dataset_path, understanding_output, task_type, target_column)
+def run(
+    dataset_path: str,
+    understanding_output: str,
+    task_type: str,
+    target_column: str = None,
+    session_id: str = "",
+) -> dict:
+    code = generate_analysis_code(
+        dataset_path, understanding_output, task_type, target_column, session_id
+    )
     script_path = GENERATED_CODE_DIR / "step2_analysis.py"
     script_path.write_text(code)
-    logger.info(f"Written: {script_path}")
+    logger.info("Written: %s", script_path)
     return {
         "script_name": "step2_analysis.py",
         "script_path": str(script_path),

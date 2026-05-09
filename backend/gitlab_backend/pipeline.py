@@ -43,7 +43,7 @@ def run(
     Runs synchronously — call this from a thread pool.
     """
     graph   = build_graph()
-    state   = create_initial_state(dataset_path, task_type, target_column)
+    state   = create_initial_state(dataset_path, task_type, target_column, session_id=session_id)
     config  = {"configurable": {"thread_id": session_id}}
 
     seen      = 0
