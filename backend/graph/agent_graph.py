@@ -86,8 +86,10 @@ class PipelineState(TypedDict):
     optimization_iteration: int     # increments every optimizer pass (used for script naming)
     optimization_history: list      # [{iteration, strategy, algorithm, metrics, primary_score}]
     best_model: dict                # {model_path, algorithm, primary_score, metrics, iteration}
+    tried_algorithms: list          # flat list of every algorithm name selected (baseline + all opt iters)
     models_tried: int               # distinct ML algorithms tried after baseline (0 → MAX_OPTIMIZATION_LOOPS)
     current_algo_tune_count: int    # tuning rounds done for the current model (resets on model switch)
+    current_algorithm: str          # algorithm we are currently exploring (set on new_algorithm; used by tune_best)
 
     # ── Optimizer scratch (must be in TypedDict so SQLite checkpointer persists them) ──
     opt_script_name: str            # e.g. step3_ml_iter1.py
@@ -96,6 +98,7 @@ class PipelineState(TypedDict):
     opt_code: str                   # generated code for current iteration
     opt_output: str                 # stdout from execute_optimization
     opt_error: str                  # stderr if failed
+    last_opt_working_code: str      # final working script content (post-fixes) for current algorithm
 
     # ── Evaluation ──
     evaluation: dict
@@ -122,6 +125,27 @@ def _primary_metric_key(task_type: str) -> str:
     if "regress" in task_type:
         return "r2_score"
     return "silhouette_score"
+
+
+_METRIC_META_KEYS = {
+    "algorithm", "iteration", "task_type", "model_path",
+    "train_samples", "test_samples", "hyperparameters", "strategy",
+}
+
+
+def _format_metrics(metrics: dict, primary_key: str) -> str:
+    """Return a compact 'key=val, ...' string of all numeric metrics for console messages."""
+    parts = []
+    if primary_key in metrics and isinstance(metrics[primary_key], (int, float)):
+        parts.append(f"{primary_key}={metrics[primary_key]:.4f}")
+    for k, v in metrics.items():
+        if k == primary_key or k in _METRIC_META_KEYS:
+            continue
+        if isinstance(v, float):
+            parts.append(f"{k}={v:.4f}")
+        elif isinstance(v, int):
+            parts.append(f"{k}={v}")
+    return ", ".join(parts) if parts else f"{primary_key}=n/a"
 
 
 def _try_parse_json(text: str) -> dict:
@@ -230,6 +254,8 @@ def node_human_approval(state: PipelineState) -> PipelineState:
 def node_ml_engineering(state: PipelineState) -> PipelineState:
     events = _emit(state, "agent_thinking", "ML Engineer Agent is selecting algorithm and generating baseline code...")
 
+    current_tried = list(state.get("tried_algorithms", []))
+
     result = ml_engineer.run(
         dataset_path=state["dataset_path"],
         task_type=state["task_type"],
@@ -237,17 +263,29 @@ def node_ml_engineering(state: PipelineState) -> PipelineState:
         understanding_output=state["understanding_output"],
         analysis_output=state["analysis_output"],
         human_feedback=state.get("human_feedback", ""),
+        tried_algorithms=current_tried,
     )
 
     algo_info = result["algorithm_info"]
+    chosen_algo = algo_info["algorithm"]
+    updated_tried = current_tried + [chosen_algo]
+
     events = _emit({"events": events}, "algorithm_selected",
-                   f"Baseline algorithm: {algo_info['algorithm']}", data=algo_info)
+                   f"Baseline algorithm: {chosen_algo}", data=algo_info)
     events = _emit({"events": events}, "algorithm_rationale",
                    algo_info.get("reason", "No rationale provided."),
-                   data={"algorithm": algo_info["algorithm"], "strategy": "baseline",
+                   data={"algorithm": chosen_algo, "strategy": "baseline",
                          "hyperparameters": algo_info.get("hyperparameters", {})})
     events = _emit({"events": events}, "code_generated", "step3_ml.py (iteration 0) written.", data=result["code"])
-    return {**state, "ml_code": result["code"], "algorithm_info": algo_info, "events": events, "ml_retries": 0}
+    return {
+        **state,
+        "ml_code": result["code"],
+        "algorithm_info": algo_info,
+        "tried_algorithms": updated_tried,
+        "current_algorithm": chosen_algo,
+        "events": events,
+        "ml_retries": 0,
+    }
 
 
 def node_execute_ml(state: PipelineState) -> PipelineState:
@@ -262,8 +300,11 @@ def node_execute_ml(state: PipelineState) -> PipelineState:
     )
 
     if result.success:
+        # Read the final file content — fix_callback may have rewritten it, so disk is authoritative.
+        working_code = (GENERATED_CODE_DIR / "step3_ml.py").read_text()
         events = _emit({"events": events}, "execution_success", "Baseline model trained.", data=result.stdout[:3000])
-        return {**state, "ml_output": result.stdout, "ml_error": "", "events": events}
+        return {**state, "ml_output": result.stdout, "ml_error": "",
+                "last_opt_working_code": working_code, "events": events}
 
     events = _emit({"events": events}, "execution_error", f"Baseline failed after {MAX_RETRIES} retries.", data=result.stderr)
     return {**state, "ml_output": "", "ml_error": result.stderr, "status": "failed", "events": events}
@@ -299,6 +340,7 @@ def node_track_metrics(state: PipelineState) -> PipelineState:
     history.append(history_entry)
 
     best = dict(state.get("best_model", {}))
+    metrics_str = _format_metrics(metrics, primary_key)
     if primary_score > best.get("primary_score", -1.0):
         best = {
             "model_path": metrics.get("model_path", str(OUTPUTS_DIR / f"model_iter{opt_iter}.pkl")),
@@ -309,11 +351,11 @@ def node_track_metrics(state: PipelineState) -> PipelineState:
             "iteration": opt_iter,
         }
         events = _emit(state, "best_model_updated",
-                       f"New best: {algo} — {primary_key}={primary_score:.4f} (iter {opt_iter})",
+                       f"New best: {algo} (iter {opt_iter}) — {metrics_str}",
                        data=best)
     else:
         events = _emit(state, "iteration_tracked",
-                       f"Iter {opt_iter}: {algo} — {primary_key}={primary_score:.4f} "
+                       f"Iter {opt_iter}: {algo} — {metrics_str} "
                        f"(best={best.get('primary_score', 0):.4f})")
 
     return {
@@ -342,6 +384,8 @@ def node_optimizer(state: PipelineState) -> PipelineState:
         f"tune round {current_tune}/{MAX_TUNE_ITERATIONS} (pass {next_iter})...",
     )
 
+    current_tried = list(state.get("tried_algorithms", []))
+
     result = optimizer.run(
         dataset_path=state["dataset_path"],
         task_type=state["task_type"],
@@ -353,30 +397,38 @@ def node_optimizer(state: PipelineState) -> PipelineState:
         current_algo_tune_count=current_tune,
         models_tried=current_models,
         human_feedback=state.get("human_feedback", ""),
+        tried_algorithms=current_tried,
+        last_working_code=state.get("last_opt_working_code", ""),
+        current_algorithm=state.get("current_algorithm", ""),
     )
 
     algo_info = result["algorithm_info"]
+    chosen_algo = algo_info["algorithm"]
     chosen_strategy = result.get("strategy", "new_algorithm")
 
     # Update the nested counters based on what was decided.
     if chosen_strategy == "tune_best":
-        new_tune_count  = current_tune + 1
-        new_models_tried = current_models
+        new_tune_count     = current_tune + 1
+        new_models_tried   = current_models
+        updated_tried      = current_tried          # tuning same model — no new entry
+        new_current_algo   = state.get("current_algorithm", chosen_algo)
     else:  # new_algorithm
-        new_tune_count  = 0          # tuning resets for the freshly selected model
-        new_models_tried = current_models + 1
+        new_tune_count     = 0
+        new_models_tried   = current_models + 1
+        updated_tried      = current_tried + [chosen_algo]
+        new_current_algo   = chosen_algo            # switch focus to the newly selected algo
 
     events = _emit({"events": events}, "algorithm_selected",
-                   f"Pass {next_iter} [{chosen_strategy}]: {algo_info['algorithm']} "
+                   f"Pass {next_iter} [{chosen_strategy}]: {chosen_algo} "
                    f"(model {new_models_tried}/{MAX_OPTIMIZATION_LOOPS}, "
                    f"tune {new_tune_count}/{MAX_TUNE_ITERATIONS})",
                    data=algo_info)
     events = _emit({"events": events}, "algorithm_rationale",
                    algo_info.get("reason", "No rationale provided."),
-                   data={"algorithm": algo_info["algorithm"], "strategy": chosen_strategy,
+                   data={"algorithm": chosen_algo, "strategy": chosen_strategy,
                          "iteration": next_iter, "hyperparameters": algo_info.get("hyperparameters", {})})
     events = _emit({"events": events}, "code_generated",
-                   f"step3_ml_iter{next_iter}.py written — [{chosen_strategy}] {algo_info['algorithm']}",
+                   f"step3_ml_iter{next_iter}.py written — [{chosen_strategy}] {chosen_algo}",
                    data=result["code"])
 
     return {
@@ -384,8 +436,10 @@ def node_optimizer(state: PipelineState) -> PipelineState:
         "optimization_iteration": next_iter,
         "models_tried": new_models_tried,
         "current_algo_tune_count": new_tune_count,
+        "tried_algorithms": updated_tried,
+        "current_algorithm": new_current_algo,
         "opt_script_name": result["script_name"],
-        "opt_algorithm": algo_info["algorithm"],
+        "opt_algorithm": chosen_algo,
         "opt_strategy": chosen_strategy,
         "opt_code": result["code"],
         "events": events,
@@ -413,9 +467,12 @@ def node_execute_optimization(state: PipelineState) -> PipelineState:
     )
 
     if result.success:
+        # Read the final file content — fix_callback may have rewritten it, so disk is authoritative.
+        working_code = (GENERATED_CODE_DIR / script_name).read_text() if script_name else ""
         events = _emit({"events": events}, "execution_success",
                        f"Iteration {iteration} succeeded.", data=result.stdout[:3000])
-        return {**state, "opt_output": result.stdout, "opt_error": "", "events": events}
+        return {**state, "opt_output": result.stdout, "opt_error": "",
+                "last_opt_working_code": working_code, "events": events}
 
     events = _emit({"events": events}, "execution_error",
                    f"Iteration {iteration} failed after {MAX_RETRIES} retries.", data=result.stderr)
@@ -621,14 +678,17 @@ def create_initial_state(
         optimization_iteration=0,
         optimization_history=[],
         best_model={},
+        tried_algorithms=[],
         models_tried=0,
         current_algo_tune_count=0,
+        current_algorithm="",
         opt_script_name="",
         opt_algorithm="",
         opt_strategy="",
         opt_code="",
         opt_output="",
         opt_error="",
+        last_opt_working_code="",
         evaluation={},
         events=[],
         status="running",

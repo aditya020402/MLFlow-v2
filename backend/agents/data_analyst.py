@@ -46,7 +46,14 @@ The code must:
      * Numeric columns: use median for skewed distributions, mean for symmetric ones
      * Categorical columns: use mode
    - Document each imputation decision in the preprocessing_decisions dict
-3. Compute Pearson correlation matrix for numeric columns
+3. Compute Pearson correlation for numeric column PAIRS (upper triangle only — NO self-correlations):
+   Use EXACTLY this code pattern:
+       _num_cols = df.select_dtypes(include="number").columns.tolist()
+       _cmat = df[_num_cols].corr()
+       correlations = {{}}
+       for _i in range(len(_num_cols)):
+           for _j in range(_i + 1, len(_num_cols)):  # i < j guarantees no self-pair
+               correlations[f"{{_num_cols[_i]}}_{{_num_cols[_j]}}"] = round(float(_cmat.iloc[_i, _j]), 4)
 4. Detect outliers using IQR method (values outside Q1-1.5*IQR to Q3+1.5*IQR)
 5. {"Analyze feature-target relationships for target column: " + target_column if target_column else "Analyze feature clusters and variance"}
 6. Generate and SAVE (do NOT show/display) the following plots to {outputs_dir}/:

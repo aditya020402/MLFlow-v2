@@ -73,14 +73,21 @@ def select_algorithm(
     understanding_output: str,
     target_column: str = None,
     human_feedback: str = "",
+    tried_algorithms: list = None,
 ) -> dict:
-    """Ask GPT-4o to freely pick the best baseline algorithm."""
+    """Ask GPT-4o to pick the best baseline algorithm, excluding already-tried ones."""
+    tried_algorithms = tried_algorithms or []
     feedback_section = f"\nHuman feedback / instructions:\n{human_feedback}" if human_feedback.strip() else ""
+    exclusion_line = (
+        f"\nDO NOT pick any of these — already tried: {tried_algorithms}"
+        if tried_algorithms else ""
+    )
 
     prompt = f"""Select the BEST ML algorithm for this dataset. Reason freely — pick whatever will work best given the data characteristics, do not restrict yourself to any predefined list.
 
 Task type: {task_type}
 {"Target column: " + target_column if target_column else ""}
+{exclusion_line}
 
 Data Understanding (summary):
 {understanding_output[:2000]}
@@ -114,27 +121,45 @@ Respond ONLY with the JSON object."""
             lines = lines[:-1]
         text = "\n".join(lines)
 
+    # Fallback defaults per task type (ordered — pick first untried)
+    _defaults_classif = [
+        ("RandomForestClassifier",     {"n_estimators": 100, "random_state": 42}),
+        ("GradientBoostingClassifier", {"n_estimators": 200, "learning_rate": 0.1, "random_state": 42}),
+        ("LogisticRegression",         {"C": 1.0, "max_iter": 1000, "random_state": 42}),
+        ("XGBClassifier",              {"n_estimators": 100, "learning_rate": 0.1, "random_state": 42}),
+    ]
+    _defaults_regress = [
+        ("RandomForestRegressor",     {"n_estimators": 100, "random_state": 42}),
+        ("GradientBoostingRegressor", {"n_estimators": 200, "learning_rate": 0.1, "random_state": 42}),
+        ("Ridge",                      {"alpha": 1.0}),
+        ("XGBRegressor",              {"n_estimators": 100, "learning_rate": 0.1, "random_state": 42}),
+    ]
+
+    def _pick_default(defaults):
+        for name, params in defaults:
+            if name not in tried_algorithms:
+                return {"algorithm": name, "reason": f"Default fallback — {name} selected as first untried algorithm.", "hyperparameters": params}
+        name, params = defaults[0]
+        return {"algorithm": name, "reason": "All defaults exhausted; reusing first.", "hyperparameters": params}
+
     try:
-        return json.loads(text)
+        result = json.loads(text)
+        # Enforce exclusion list — LLM may ignore it
+        if tried_algorithms and result.get("algorithm") in tried_algorithms:
+            logger.warning("LLM picked already-tried baseline '%s'; substituting.", result.get("algorithm"))
+            if "classif" in task_type:
+                return _pick_default(_defaults_classif)
+            if "regress" in task_type:
+                return _pick_default(_defaults_regress)
+            return {"algorithm": "KMeans", "reason": "Default clustering fallback.", "hyperparameters": {"n_clusters": 3, "random_state": 42}}
+        return result
     except json.JSONDecodeError:
         logger.warning("Could not parse algorithm JSON, using default.")
-        if task_type == "supervised_classification":
-            return {
-                "algorithm": "RandomForestClassifier",
-                "reason": "Robust default",
-                "hyperparameters": {"n_estimators": 100, "random_state": 42},
-            }
-        if task_type == "supervised_regression":
-            return {
-                "algorithm": "RandomForestRegressor",
-                "reason": "Robust default",
-                "hyperparameters": {"n_estimators": 100, "random_state": 42},
-            }
-        return {
-            "algorithm": "KMeans",
-            "reason": "Default clustering",
-            "hyperparameters": {"n_clusters": 3, "random_state": 42},
-        }
+        if "classif" in task_type:
+            return _pick_default(_defaults_classif)
+        if "regress" in task_type:
+            return _pick_default(_defaults_regress)
+        return {"algorithm": "KMeans", "reason": "Default clustering", "hyperparameters": {"n_clusters": 3, "random_state": 42}}
 
 
 def generate_ml_code(
@@ -272,10 +297,12 @@ def run(
     understanding_output: str,
     analysis_output: str,
     human_feedback: str = "",
+    tried_algorithms: list = None,
 ) -> dict:
     """Generate baseline ML code, write it, return metadata dict."""
     algorithm_info = select_algorithm(
-        task_type, analysis_output, understanding_output, target_column, human_feedback
+        task_type, analysis_output, understanding_output, target_column,
+        human_feedback, tried_algorithms=tried_algorithms or [],
     )
     logger.info(
         "Selected algorithm: %s — %s",

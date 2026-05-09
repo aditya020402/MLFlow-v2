@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import AgentConsole from "./AgentConsole";
+import AnalysisTab from "./AnalysisTab";
 import AnalysisViewer from "./AnalysisViewer";
 import CodeViewer from "./CodeViewer";
 import ResultsDashboard from "./ResultsDashboard";
@@ -60,6 +61,7 @@ export default function PipelineDashboard({ session, onReset }) {
   const [evaluation, setEvaluation] = useState({});
   const [algorithmInfo, setAlgorithmInfo] = useState({});
   const [analysisData, setAnalysisData] = useState(null);
+  const [analysisReady, setAnalysisReady] = useState(false);
   const [feedback, setFeedback] = useState("");
   const [approving, setApproving] = useState(false);
   const [activeTab, setActiveTab] = useState("console");
@@ -68,7 +70,10 @@ export default function PipelineDashboard({ session, onReset }) {
   const handleEvent = (evt) => {
     setEvents((prev) => [...prev, evt]);
     if (evt.type === "awaiting_approval") setPipelineStatus("awaiting_approval");
-    if (evt.type === "analysis_data" && evt.data) setAnalysisData(evt.data);
+    if (evt.type === "analysis_data" && evt.data) {
+      setAnalysisData(evt.data);
+      setAnalysisReady(true);
+    }
     if (evt.type === "completed") { setPipelineStatus("completed"); esRef.current?.close(); }
     if (evt.type === "error") { setPipelineStatus("error"); esRef.current?.close(); }
     if (evt.type === "stream_end") esRef.current?.close();
@@ -113,9 +118,10 @@ export default function PipelineDashboard({ session, onReset }) {
   const awaitingApproval = pipelineStatus === "awaiting_approval";
 
   const TABS = [
-    { id: "console", label: "Console" },
-    { id: "code",    label: "Generated Code" },
-    { id: "results", label: "Results" },
+    { id: "console",  label: "Console" },
+    { id: "analysis", label: "Analysis", badge: analysisReady },
+    { id: "code",     label: "Generated Code" },
+    { id: "results",  label: "Results" },
   ];
 
   return (
@@ -202,13 +208,16 @@ export default function PipelineDashboard({ session, onReset }) {
           <button
             key={t.id}
             onClick={() => setActiveTab(t.id)}
-            className={`px-4 py-2 text-sm font-medium rounded-t-lg transition-colors ${
+            className={`relative px-4 py-2 text-sm font-medium rounded-t-lg transition-colors ${
               activeTab === t.id
                 ? "text-brand-400 border-b-2 border-brand-500 bg-gray-900"
                 : "text-gray-400 hover:text-gray-200"
             }`}
           >
             {t.label}
+            {t.badge && activeTab !== t.id && (
+              <span className="absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full bg-brand-400" />
+            )}
           </button>
         ))}
       </div>
@@ -216,6 +225,13 @@ export default function PipelineDashboard({ session, onReset }) {
       {/* Tab content */}
       {activeTab === "console" && (
         <AgentConsole events={events} isRunning={isRunning} />
+      )}
+      {activeTab === "analysis" && (
+        <AnalysisTab
+          sessionId={sessionId}
+          analysisData={analysisData}
+          ready={analysisReady}
+        />
       )}
       {activeTab === "code" && (
         <CodeViewer sessionId={sessionId} />

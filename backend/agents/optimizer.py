@@ -26,6 +26,93 @@ MODEL = "gpt-4o"
 MAX_TUNE_ITERATIONS    = int(os.environ.get("MAX_TUNE_ITERATIONS", "2"))
 MAX_OPTIMIZATION_LOOPS = int(os.environ.get("MAX_OPTIMIZATION_LOOPS", "3"))
 
+# Ordered lists used to deterministically substitute when LLM picks a duplicate algo.
+_CLASSIFICATION_ALGOS = [
+    ("RandomForestClassifier",      {"n_estimators": 100, "random_state": 42},
+     {"n_estimators": [100, 200, 300], "max_depth": [5, 10, 15, None]}),
+    ("GradientBoostingClassifier",  {"n_estimators": 200, "learning_rate": 0.1, "max_depth": 4, "random_state": 42},
+     {"n_estimators": [100, 200, 300], "learning_rate": [0.01, 0.05, 0.1, 0.2], "max_depth": [3, 4, 5, 6]}),
+    ("LogisticRegression",          {"C": 1.0, "max_iter": 1000, "random_state": 42},
+     {"C": [0.01, 0.1, 1.0, 10.0]}),
+    ("SVC",                         {"C": 1.0, "kernel": "rbf"},
+     {"C": [0.1, 1.0, 10.0], "kernel": ["rbf", "linear"]}),
+    ("XGBClassifier",               {"n_estimators": 100, "learning_rate": 0.1, "use_label_encoder": False, "eval_metric": "logloss", "random_state": 42},
+     {"n_estimators": [100, 200, 300], "learning_rate": [0.01, 0.05, 0.1], "max_depth": [3, 5, 7]}),
+    ("ExtraTreesClassifier",        {"n_estimators": 100, "random_state": 42},
+     {"n_estimators": [100, 200, 300], "max_depth": [5, 10, None]}),
+    ("AdaBoostClassifier",          {"n_estimators": 50, "learning_rate": 1.0, "random_state": 42},
+     {"n_estimators": [50, 100, 200], "learning_rate": [0.01, 0.1, 0.5, 1.0]}),
+    ("KNeighborsClassifier",        {"n_neighbors": 5},
+     {"n_neighbors": [3, 5, 7, 11, 15]}),
+    ("DecisionTreeClassifier",      {"max_depth": 10, "random_state": 42},
+     {"max_depth": [5, 10, 15, 20, None], "min_samples_split": [2, 5, 10]}),
+    ("LGBMClassifier",              {"n_estimators": 100, "learning_rate": 0.1, "random_state": 42},
+     {"n_estimators": [100, 200, 300], "learning_rate": [0.01, 0.05, 0.1], "num_leaves": [31, 63, 127]}),
+]
+
+_REGRESSION_ALGOS = [
+    ("RandomForestRegressor",       {"n_estimators": 100, "random_state": 42},
+     {"n_estimators": [100, 200, 300], "max_depth": [5, 10, 15, None]}),
+    ("GradientBoostingRegressor",   {"n_estimators": 200, "learning_rate": 0.1, "max_depth": 4, "random_state": 42},
+     {"n_estimators": [100, 200, 300], "learning_rate": [0.01, 0.05, 0.1, 0.2], "max_depth": [3, 4, 5, 6]}),
+    ("Ridge",                       {"alpha": 1.0},
+     {"alpha": [0.01, 0.1, 1.0, 10.0, 100.0]}),
+    ("Lasso",                       {"alpha": 1.0},
+     {"alpha": [0.001, 0.01, 0.1, 1.0, 10.0]}),
+    ("XGBRegressor",                {"n_estimators": 100, "learning_rate": 0.1, "random_state": 42},
+     {"n_estimators": [100, 200, 300], "learning_rate": [0.01, 0.05, 0.1], "max_depth": [3, 5, 7]}),
+    ("ExtraTreesRegressor",         {"n_estimators": 100, "random_state": 42},
+     {"n_estimators": [100, 200, 300], "max_depth": [5, 10, None]}),
+    ("SVR",                         {"C": 1.0, "kernel": "rbf"},
+     {"C": [0.1, 1.0, 10.0], "kernel": ["rbf", "linear"]}),
+    ("AdaBoostRegressor",           {"n_estimators": 50, "learning_rate": 1.0, "random_state": 42},
+     {"n_estimators": [50, 100, 200], "learning_rate": [0.01, 0.1, 0.5, 1.0]}),
+    ("KNeighborsRegressor",         {"n_neighbors": 5},
+     {"n_neighbors": [3, 5, 7, 11, 15]}),
+    ("LGBMRegressor",               {"n_estimators": 100, "learning_rate": 0.1, "random_state": 42},
+     {"n_estimators": [100, 200, 300], "learning_rate": [0.01, 0.05, 0.1], "num_leaves": [31, 63, 127]}),
+]
+
+_CLUSTERING_ALGOS = [
+    ("KMeans",                 {"n_clusters": 5, "random_state": 42},
+     {"n_clusters": [3, 4, 5, 6, 7]}),
+    ("AgglomerativeClustering",{"n_clusters": 4},
+     {"n_clusters": [3, 4, 5, 6]}),
+    ("GaussianMixture",        {"n_components": 4, "random_state": 42},
+     {"n_components": [3, 4, 5, 6]}),
+    ("MiniBatchKMeans",        {"n_clusters": 5, "random_state": 42},
+     {"n_clusters": [3, 4, 5, 6, 7]}),
+]
+
+
+def _fallback_new_algo(task_type: str, already_tried: list) -> dict:
+    """Return the first untried algorithm from the ordered defaults list."""
+    if "classif" in task_type:
+        candidates = _CLASSIFICATION_ALGOS
+    elif "regress" in task_type:
+        candidates = _REGRESSION_ALGOS
+    else:
+        candidates = _CLUSTERING_ALGOS
+
+    for name, params, space in candidates:
+        if name not in already_tried:
+            return {
+                "strategy": "new_algorithm",
+                "algorithm": name,
+                "hyperparameters": params,
+                "search_space": space,
+                "reason": f"Deterministic fallback: {name} selected as next untried algorithm.",
+            }
+    # All known algos exhausted — return last one anyway
+    name, params, space = candidates[-1]
+    return {
+        "strategy": "new_algorithm",
+        "algorithm": name,
+        "hyperparameters": params,
+        "search_space": space,
+        "reason": "All known algorithms have been tried; rerunning last candidate with fresh params.",
+    }
+
 SYSTEM_PROMPT = """You are an expert ML Optimization Engineer. Write clean, executable Python code.
 
 Rules:
@@ -92,6 +179,8 @@ def select_next_strategy(
     current_algo_tune_count: int,
     models_tried: int,
     human_feedback: str = "",
+    tried_algorithms: list = None,
+    current_algorithm: str = "",
 ) -> dict:
     """Deterministically pick PATH A or PATH B from the graph-level counters.
 
@@ -105,7 +194,28 @@ def select_next_strategy(
     best_algo = best_model.get("algorithm", "unknown")
     best_score = best_model.get("primary_score", 0.0)
     best_metric = best_model.get("primary_metric", "score")
-    best_hyperparams = best_model.get("metrics", {}).get("hyperparameters", {})
+
+    # tune_best tunes the algorithm we're currently focusing on, not necessarily
+    # the all-time best. This ensures a new_algorithm gets its own tuning rounds
+    # before we compare it against the historical best.
+    tune_algo = current_algorithm if current_algorithm else best_algo
+
+    # Find that algorithm's most recent hyperparameters from history (or fall
+    # back to best_model's if it IS the best model, or empty dict).
+    tune_hyperparams = {}
+    for h in reversed(optimization_history):
+        if h.get("algorithm") == tune_algo:
+            tune_hyperparams = (h.get("metrics") or {}).get("hyperparameters", {})
+            break
+    if not tune_hyperparams and tune_algo == best_algo:
+        tune_hyperparams = best_model.get("metrics", {}).get("hyperparameters", {})
+
+    # Score and metric for the algo we're tuning (may differ from all-time best)
+    tune_score = best_score
+    for h in reversed(optimization_history):
+        if h.get("algorithm") == tune_algo:
+            tune_score = h.get("primary_score", best_score)
+            break
 
     history_summary = json.dumps(
         [
@@ -119,33 +229,35 @@ def select_next_strategy(
         ],
         indent=2,
     )
-    already_tried = [h.get("algorithm") for h in optimization_history]
+    # Use the authoritative state-tracked list; fall back to deriving from history.
+    already_tried = tried_algorithms if tried_algorithms is not None else [h.get("algorithm") for h in optimization_history]
     feedback_section = (
         f"\nHuman feedback / instructions:\n{human_feedback}"
         if human_feedback.strip() else ""
     )
 
-    # ── PATH A: tune the current model ────────────────────────────
+    # ── PATH A: tune the current algorithm ────────────────────────
     if current_algo_tune_count < MAX_TUNE_ITERATIONS:
         logger.info(
             "Path A — tuning %s (tune round %d/%d, model %d/%d)",
-            best_algo, current_algo_tune_count + 1, MAX_TUNE_ITERATIONS,
+            tune_algo, current_algo_tune_count + 1, MAX_TUNE_ITERATIONS,
             models_tried, MAX_OPTIMIZATION_LOOPS,
         )
         prompt = f"""You are an ML hyperparameter tuning expert.
 
-Current model to tune: {best_algo}
-  Current score ({best_metric}): {best_score:.4f}
-  Current hyperparameters: {json.dumps(best_hyperparams, indent=2)}
+Current model to tune: {tune_algo}
+  Current score ({best_metric}): {tune_score:.4f}
+  Current hyperparameters: {json.dumps(tune_hyperparams, indent=2)}
   Tune round: {current_algo_tune_count + 1} of {MAX_TUNE_ITERATIONS}
+  Overall best so far: {best_algo} at {best_score:.4f} {best_metric}
 
 Task type: {task_type}
 Optimization history:
 {history_summary}
 {feedback_section}
 
-Provide the hyperparameter search space for RandomizedSearchCV to improve {best_algo}.
-Focus on ranges most likely to push {best_metric} beyond {best_score:.4f}.
+Provide the hyperparameter search space for RandomizedSearchCV to improve {tune_algo}.
+Focus on ranges most likely to push {best_metric} beyond {tune_score:.4f}.
 
 For the `reason` field write 2-3 sentences explaining:
 1. What the current results show and which hyperparameter dimensions have the most room to improve.
@@ -155,9 +267,9 @@ For the `reason` field write 2-3 sentences explaining:
 Respond ONLY with this JSON:
 {{
   "strategy": "tune_best",
-  "algorithm": "{best_algo}",
+  "algorithm": "{tune_algo}",
   "reason": "...",
-  "hyperparameters": {json.dumps(best_hyperparams) if best_hyperparams else '{"n_estimators": 100}'},
+  "hyperparameters": {json.dumps(tune_hyperparams) if tune_hyperparams else '{"n_estimators": 100}'},
   "search_space": {{"<param>": [<v1>, <v2>, ...], ...}}
 }}"""
 
@@ -168,13 +280,13 @@ Respond ONLY with this JSON:
         strategy = "tune_best"
         fallback = {
             "strategy": "tune_best",
-            "algorithm": best_algo,
+            "algorithm": tune_algo,
             "reason": (
-                f"Fallback: continuing to tune {best_algo} (round {current_algo_tune_count + 1}/"
+                f"Fallback: continuing to tune {tune_algo} (round {current_algo_tune_count + 1}/"
                 f"{MAX_TUNE_ITERATIONS}). Exploring wider hyperparameter ranges to push beyond "
-                f"{best_score:.4f} {best_metric}."
+                f"{tune_score:.4f} {best_metric}."
             ),
-            "hyperparameters": best_hyperparams or {"n_estimators": 100, "random_state": 42},
+            "hyperparameters": tune_hyperparams or {"n_estimators": 100, "random_state": 42},
             "search_space": {
                 "n_estimators": [100, 200, 300, 500],
                 "max_depth": [5, 10, 15, 20, None],
@@ -186,13 +298,13 @@ Respond ONLY with this JSON:
     else:
         logger.info(
             "Path B — tuning budget exhausted for %s (%d/%d). Selecting new algorithm (model %d→%d/%d).",
-            best_algo, current_algo_tune_count, MAX_TUNE_ITERATIONS,
+            tune_algo, current_algo_tune_count, MAX_TUNE_ITERATIONS,
             models_tried, models_tried + 1, MAX_OPTIMIZATION_LOOPS,
         )
         prompt = f"""You are an ML algorithm selection expert.
 
-The current model ({best_algo}) has been tuned {current_algo_tune_count} time(s) — budget exhausted.
-Best score so far: {best_score:.4f} ({best_metric})
+The current model ({tune_algo}) has been tuned {current_algo_tune_count} time(s) — budget exhausted.
+Best score so far: {best_score:.4f} ({best_metric}) achieved by {best_algo}
 
 Task type: {task_type}
 Already tried (DO NOT pick these): {already_tried}
@@ -231,7 +343,7 @@ Respond ONLY with this JSON:
                 "strategy": "new_algorithm",
                 "algorithm": "GradientBoostingClassifier",
                 "reason": (
-                    f"{best_algo} has been fully tuned ({current_algo_tune_count} rounds). "
+                    f"{tune_algo} has been fully tuned ({current_algo_tune_count} rounds). "
                     "GradientBoosting often captures non-linear patterns missed by other ensembles. "
                     f"Expect to push past {best_score:.4f} {best_metric} with careful learning-rate tuning."
                 ),
@@ -247,7 +359,7 @@ Respond ONLY with this JSON:
                 "strategy": "new_algorithm",
                 "algorithm": "GradientBoostingRegressor",
                 "reason": (
-                    f"{best_algo} has been fully tuned ({current_algo_tune_count} rounds). "
+                    f"{tune_algo} has been fully tuned ({current_algo_tune_count} rounds). "
                     "GradientBoosting handles complex feature interactions and often improves R². "
                     f"Targeting {best_metric} improvement beyond {best_score:.4f}."
                 ),
@@ -263,7 +375,7 @@ Respond ONLY with this JSON:
                 "strategy": "new_algorithm",
                 "algorithm": "AgglomerativeClustering",
                 "reason": (
-                    f"{best_algo} tuning exhausted. "
+                    f"{tune_algo} tuning exhausted. "
                     "AgglomerativeClustering uses a different linkage-based approach "
                     "that may reveal cluster structures KMeans missed."
                 ),
@@ -291,9 +403,26 @@ Respond ONLY with this JSON:
     try:
         result = json.loads(text)
         result["strategy"] = strategy   # always override — LLM does not decide this
+
+        # For Path B, guarantee the LLM didn't hallucinate a duplicate algorithm.
+        if strategy == "new_algorithm":
+            chosen = result.get("algorithm", "")
+            if chosen in already_tried:
+                logger.warning(
+                    "LLM picked already-tried algorithm '%s'; substituting from defaults.", chosen
+                )
+                sub = _fallback_new_algo(task_type, already_tried)
+                result.update(sub)
+                result["reason"] = (
+                    f"LLM suggested '{chosen}' which was already tried. "
+                    + sub["reason"]
+                )
+
         return result
     except json.JSONDecodeError:
         logger.warning("Could not parse optimizer JSON; using fallback.")
+        if strategy == "new_algorithm" and fallback.get("algorithm") in already_tried:
+            return _fallback_new_algo(task_type, already_tried)
         return fallback
 
 
@@ -306,6 +435,7 @@ def generate_optimization_code(
     optimization_history: list,
     best_model: dict,
     human_feedback: str = "",
+    last_working_code: str = "",
 ) -> str:
     """Return code string for the given iteration."""
     algo = strategy["algorithm"]
@@ -341,6 +471,50 @@ def generate_optimization_code(
         if human_feedback.strip() else ""
     )
 
+    # ── PATH A with working code — template adaptation (avoids repeating past bugs) ──
+    if strat_type == "tune_best" and last_working_code.strip():
+        logger.info(
+            "Optimizer [iter %d] tune_best: adapting previous working code as template.", iteration
+        )
+        template_prompt = f"""You have a working Python ML script that successfully trained {algo}.
+Adapt it for tuning round {iteration} by updating ONLY the hyperparameter search space and metadata.
+
+PREVIOUS WORKING CODE:
+{last_working_code}
+
+Changes to make — update THESE values and NOTHING ELSE:
+1. param_distributions / search_space → {search_space}
+2. Base hyperparameters passed to {algo}(...) → {hyperparams}
+3. Model save path → "{model_path}"
+4. "iteration" value in the metrics dict → {iteration}
+5. RandomizedSearchCV n_iter → 20, cv → 5  (keep scoring='{scoring}', n_jobs=-1, random_state=42)
+6. Baseline to beat comment → {baseline_score:.4f} ({primary_metric}) from {baseline_algo}
+
+Keep EVERYTHING ELSE byte-for-byte identical:
+- All imports
+- Data loading (pd.read_csv)
+- All preprocessing steps (missing-value handling, encoding, scaling)
+- train_test_split parameters
+- Metric computation code
+- The METRICS_JSON_START / METRICS_JSON_END print block
+- The self-check (pickle reload + re-predict)
+- All variable names and structure
+
+Output ONLY the complete adapted Python code."""
+
+        response = client.chat.completions.create(
+            model=MODEL,
+            max_tokens=4096,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": template_prompt},
+            ],
+        )
+        code = _strip_markdown(response.choices[0].message.content.strip())
+        logger.info("Optimizer [iter %d] tune_best template adapted for %s", iteration, algo)
+        return code
+
+    # ── PATH A without working code OR PATH B — generate from scratch ──────
     if strat_type == "tune_best":
         tuning_section = f"""5. HYPERPARAMETER TUNING — PATH A (tune_best):
    This iteration tunes the current best model via RandomizedSearchCV.
@@ -507,6 +681,9 @@ def run(
     current_algo_tune_count: int = 0,
     models_tried: int = 0,
     human_feedback: str = "",
+    tried_algorithms: list = None,
+    last_working_code: str = "",
+    current_algorithm: str = "",
 ) -> dict:
     """Determine strategy from counters, generate code, write it, return metadata dict."""
     strategy = select_next_strategy(
@@ -514,6 +691,8 @@ def run(
         understanding_output, best_model,
         current_algo_tune_count, models_tried,
         human_feedback,
+        tried_algorithms=tried_algorithms or [],
+        current_algorithm=current_algorithm,
     )
     logger.info(
         "Optimizer [iter %d] strategy=%s algorithm=%s — %s",
@@ -526,6 +705,7 @@ def run(
     code = generate_optimization_code(
         dataset_path, task_type, target_column,
         iteration, strategy, optimization_history, best_model, human_feedback,
+        last_working_code=last_working_code if strategy.get("strategy") == "tune_best" else "",
     )
 
     script_name = f"step3_ml_iter{iteration}.py"
