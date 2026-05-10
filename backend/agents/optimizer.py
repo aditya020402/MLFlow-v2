@@ -845,13 +845,30 @@ Output ONLY the Python code."""
 
 
 def fix_optimization_code(
-    current_code: str, stderr: str, stdout: str, attempt: int
+    current_code: str,
+    stderr: str,
+    stdout: str,
+    attempt: int,
+    dataset_path: str = "",
+    task_type: str = "",
+    target_column: str = "",
 ) -> str:
     logger.info("Optimizer fixing code (attempt %d)...", attempt)
 
+    context_lines = []
+    if dataset_path:
+        context_lines.append(f"Dataset path: {dataset_path}")
+    if task_type:
+        context_lines.append(f"Task type: {task_type}")
+    if target_column:
+        context_lines.append(
+            f"Target column: '{target_column}' — use this exact column name, do NOT hardcode 'target' or guess."
+        )
+    context_block = ("\n".join(context_lines) + "\n\n") if context_lines else ""
+
     prompt = f"""Code failed.
 
-ERROR:
+{context_block}ERROR:
 {stderr}
 
 STDOUT:
@@ -875,10 +892,18 @@ Fix it. Output ONLY the complete fixed Python code."""
     return _strip_markdown(response.choices[0].message.content.strip())
 
 
-def make_fix_callback(current_code_path: Path):
+def make_fix_callback(
+    current_code_path: Path,
+    dataset_path: str = "",
+    task_type: str = "",
+    target_column: str = "",
+):
     def callback(stderr: str, stdout: str, attempt: int) -> str:
         return fix_optimization_code(
-            current_code_path.read_text(), stderr, stdout, attempt
+            current_code_path.read_text(), stderr, stdout, attempt,
+            dataset_path=dataset_path,
+            task_type=task_type,
+            target_column=target_column,
         )
     return callback
 
@@ -937,7 +962,7 @@ def run(
 
     script_name = f"step3_ml_iter{iteration}.py"
     script_path = GENERATED_CODE_DIR / script_name
-    script_path.write_text(code)
+    script_path.write_text(code, encoding="utf-8")
     logger.info("Written: %s", script_path)
 
     return {
@@ -946,5 +971,10 @@ def run(
         "code": code,
         "algorithm_info": strategy,
         "strategy": strategy.get("strategy", "new_algorithm"),
-        "fix_callback": make_fix_callback(script_path),
+        "fix_callback": make_fix_callback(
+            script_path,
+            dataset_path=dataset_path,
+            task_type=task_type,
+            target_column=target_column or "",
+        ),
     }

@@ -358,7 +358,7 @@ def run(dataset_path: str, task_type: str, target_column: str = None) -> dict:
     code = generate_understanding_code(dataset_path, task_type, target_column, dataset_context)
 
     script_path = GENERATED_CODE_DIR / "step1a_general.py"
-    script_path.write_text(code)
+    script_path.write_text(code, encoding="utf-8")
     logger.info("Written: %s", script_path)
     return {
         "script_name": "step1a_general.py",

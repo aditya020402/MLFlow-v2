@@ -36,7 +36,8 @@ Rules:
 FIX_SYSTEM_PROMPT = """You are an expert Python debugger. Fix the provided code based on the error.
 Output ONLY the complete fixed Python code. No explanations, no markdown, no backticks.
 NEVER use mean_squared_error(..., squared=False) — removed in scikit-learn 1.4.
-Compute RMSE as: rmse = float(np.sqrt(mean_squared_error(y_test, predictions)))"""
+Compute RMSE as: rmse = float(np.sqrt(mean_squared_error(y_test, predictions)))
+CRITICAL: If a target column is provided in the context, use that EXACT column name. NEVER hardcode 'target' as a column name. NEVER fall back to the last column — if the column is missing, raise a clear error naming the expected column."""
 
 ALGORITHM_SELECTION_PROMPT = """You are an ML algorithm selection expert.
 Respond ONLY with a JSON object — no markdown, no extra text:
@@ -383,7 +384,11 @@ Reason: {reason}
 6. Compute on TEST SET ONLY: {_metrics_block(task_type, algo)}
    {"For clustering: predictions = model.fit_predict(X_test_final); silhouette_score only if len(set(predictions)) > 1" if is_cluster else ""}
 
-7. Save model to: {model_path}  (use pickle.dump)
+7. Save model AND feature columns:
+   import pickle, os
+   pickle.dump(model, open("{model_path}", "wb"))
+   features_path = "{model_path}".replace(".pkl", "_features.pkl")
+   pickle.dump(list(X_train.columns), open(features_path, "wb"))
 
 8. SELF-CHECK — reload model and re-predict; warn if results differ:
    sc_model = pickle.load(open("{model_path}", "rb"))
@@ -419,10 +424,31 @@ Output ONLY the Python code."""
     return code
 
 
-def fix_ml_code(current_code: str, stderr: str, stdout: str, attempt: int) -> str:
+def fix_ml_code(
+    current_code: str,
+    stderr: str,
+    stdout: str,
+    attempt: int,
+    dataset_path: str = "",
+    task_type: str = "",
+    target_column: str = "",
+) -> str:
     logger.info("ML Engineer Agent fixing code (attempt %d)...", attempt)
 
+    context_lines = []
+    if dataset_path:
+        context_lines.append(f"Dataset path: {dataset_path}")
+    if task_type:
+        context_lines.append(f"Task type: {task_type}")
+    if target_column:
+        context_lines.append(
+            f"Target column: '{target_column}' — use this exact column name, do NOT hardcode 'target' or guess the last column."
+        )
+    context_block = "\n".join(context_lines)
+
     prompt = f"""The following Python code failed.
+
+{context_block}
 
 ERROR:
 {stderr}
@@ -452,10 +478,20 @@ Fix it. Output ONLY the complete fixed Python code."""
     return fixed
 
 
-def make_fix_callback(current_code_path: Path):
+def make_fix_callback(
+    current_code_path: Path,
+    dataset_path: str = "",
+    task_type: str = "",
+    target_column: str = "",
+):
     def callback(stderr: str, stdout: str, attempt: int) -> str:
         current_code = current_code_path.read_text()
-        return fix_ml_code(current_code, stderr, stdout, attempt)
+        return fix_ml_code(
+            current_code, stderr, stdout, attempt,
+            dataset_path=dataset_path,
+            task_type=task_type,
+            target_column=target_column,
+        )
     return callback
 
 
@@ -587,7 +623,7 @@ def run(
         analysis_data=analysis_data,
     )
     script_path = GENERATED_CODE_DIR / "step3_ml.py"
-    script_path.write_text(code)
+    script_path.write_text(code, encoding="utf-8")
     logger.info("Written: %s", script_path)
 
     return {
@@ -595,5 +631,10 @@ def run(
         "script_path": str(script_path),
         "code": code,
         "algorithm_info": algorithm_info,
-        "fix_callback": make_fix_callback(script_path),
+        "fix_callback": make_fix_callback(
+            script_path,
+            dataset_path=dataset_path,
+            task_type=task_type,
+            target_column=target_column or "",
+        ),
     }

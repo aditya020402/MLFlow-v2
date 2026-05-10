@@ -35,14 +35,12 @@ def parse_metrics_from_output(stdout: str) -> dict:
 
     Falls back to the last JSON object in stdout if markers are absent.
     """
-    match = re.search(
-        r"METRICS_JSON_START\s*(\{.*?\})\s*METRICS_JSON_END",
-        stdout,
-        re.DOTALL,
-    )
-    if match:
+    start = stdout.find("METRICS_JSON_START")
+    end   = stdout.find("METRICS_JSON_END")
+    if start != -1 and end != -1 and end > start:
+        raw = stdout[start + len("METRICS_JSON_START"):end].strip()
         try:
-            return json.loads(match.group(1))
+            return json.loads(raw)
         except json.JSONDecodeError:
             pass
 
@@ -210,7 +208,7 @@ def run_script_with_retry(
         fixed_code = fix_callback(effective_stderr, result.stdout, attempt)
         if fixed_code:
             script_path = GENERATED_CODE_DIR / script_name
-            script_path.write_text(fixed_code)
+            script_path.write_text(fixed_code, encoding="utf-8")
             logger.info("Code updated, retrying...")
         else:
             logger.error("Agent returned no fix.")

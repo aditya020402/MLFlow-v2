@@ -356,7 +356,7 @@ def run(
     code = generate_task_profiling_code(dataset_path, task_type, target_column, general_output)
 
     script_path = GENERATED_CODE_DIR / "step1b_profiling.py"
-    script_path.write_text(code)
+    script_path.write_text(code, encoding="utf-8")
     logger.info("Written: %s", script_path)
     return {
         "script_name": "step1b_profiling.py",

@@ -11,6 +11,7 @@ GENERATED_CODE_DIR = Path(__file__).parent.parent / "generated_code"
 OUTPUTS_DIR        = Path(__file__).parent.parent / "outputs"
 
 from agents.llm_client import client, MODEL
+from agents.token_tracker import record as _tok
 
 SYSTEM_PROMPT = """You are an expert ML Testing Agent. Your ONLY job is to write clean, executable Python code.
 
@@ -18,8 +19,17 @@ Rules:
 - Output ONLY valid Python code. No markdown, no backticks, no explanations.
 - The code must be completely self-contained and runnable.
 - NEVER retrain or fit any model — only load and predict.
+- FEATURE ALIGNMENT IS MANDATORY: After all preprocessing, ALWAYS align X to the saved feature list:
+    features_path = model_path.replace(".pkl", "_features.pkl")
+    if os.path.exists(features_path):
+        saved_cols = pickle.load(open(features_path, "rb"))
+        for col in saved_cols:
+            if col not in X.columns:
+                X[col] = 0
+        X = X[saved_cols]
+  If features_path does not exist, fall back to model.n_features_in_ to validate column count.
 - ALWAYS include ALL necessary imports at the top of the script. In particular:
-    import json, pickle
+    import json, pickle, os
     import pandas as pd
     import numpy as np
     from sklearn.preprocessing import LabelEncoder, StandardScaler, OrdinalEncoder, MinMaxScaler
@@ -48,22 +58,38 @@ Rules:
 FIX_SYSTEM_PROMPT = """You are an expert Python debugger. Fix the provided code based on the error.
 Output ONLY the complete fixed Python code. No explanations, no markdown, no backticks.
 ALWAYS ensure all necessary imports are present at the top of the script, including:
-    import json, pickle
+    import json, pickle, os
     import pandas as pd
     import numpy as np
     from sklearn.preprocessing import LabelEncoder, StandardScaler, OrdinalEncoder, MinMaxScaler
 NEVER use mean_squared_error(..., squared=False) — use float(np.sqrt(mean_squared_error(...))) instead.
 For clustering models use fit_predict(X) not predict(X).
-The try/except MUST always print TEST_RESULTS_START / TEST_RESULTS_END even on error."""
+The try/except MUST always print TEST_RESULTS_START / TEST_RESULTS_END even on error.
+FEATURE MISMATCH FIX: If the error mentions features/shape mismatch, add this block AFTER all preprocessing and BEFORE predict():
+    features_path = model_path.replace(".pkl", "_features.pkl")
+    if os.path.exists(features_path):
+        saved_cols = pickle.load(open(features_path, "rb"))
+        for col in saved_cols:
+            if col not in X.columns:
+                X[col] = 0
+        X = X[saved_cols]"""
 
 
 def _metrics_code(task_type: str, target_col: str) -> str:
     if "classif" in task_type:
         return f"""\
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, classification_report
-# Cast both to str to handle label-encoded (int) predictions vs raw string labels
-y_pred_cmp   = pd.Series(y_pred).reset_index(drop=True).astype(str)
-y_actual_cmp = pd.Series(y_actual).reset_index(drop=True).astype(str)
+_y_pred_s   = pd.Series(y_pred).reset_index(drop=True)
+_y_actual_s = pd.Series(y_actual).reset_index(drop=True)
+if pd.api.types.is_numeric_dtype(_y_pred_s) and not pd.api.types.is_numeric_dtype(_y_actual_s):
+    from sklearn.preprocessing import LabelEncoder as _LE
+    _le = _LE()
+    _le.fit(sorted(_y_actual_s.unique()))
+    y_actual_cmp = pd.Series(_le.transform(_y_actual_s)).astype(str)
+    y_pred_cmp   = _y_pred_s.astype(str)
+else:
+    y_pred_cmp   = _y_pred_s.astype(str)
+    y_actual_cmp = _y_actual_s.astype(str)
 metrics = {{
     "accuracy":  round(float(accuracy_score(y_actual_cmp, y_pred_cmp)), 4),
     "f1":        round(float(f1_score(y_actual_cmp, y_pred_cmp, average="weighted", zero_division=0)), 4),
@@ -126,7 +152,7 @@ Task type:     {task_type}
 === REQUIREMENTS ===
 
 0. Start with these imports (add others as needed by the training code):
-   import json, pickle
+   import json, pickle, os
    import pandas as pd
    import numpy as np
    from sklearn.preprocessing import LabelEncoder, StandardScaler, OrdinalEncoder, MinMaxScaler
@@ -146,6 +172,18 @@ Task type:     {task_type}
    - Apply scaling if the training code used StandardScaler — fit a NEW scaler on test set
      (since we don't have the saved scaler — this is acceptable for inference evaluation)
    {"- Separate X and y_actual: X = df_test.drop(columns=['" + target_column + "']) if '" + target_column + "' in df_test.columns else df_test.copy(); y_actual_exists = '" + target_column + "' in df_test.columns" if has_target else "- X = df_test (all columns)"}
+
+   MANDATORY FEATURE ALIGNMENT (add this block after all preprocessing, before predict):
+   import os
+   model_path = "{model_path}"
+   features_path = model_path.replace(".pkl", "_features.pkl")
+   if os.path.exists(features_path):
+       saved_cols = pickle.load(open(features_path, "rb"))
+       for col in saved_cols:
+           if col not in X.columns:
+               X[col] = 0
+       X = X[saved_cols]
+   This ensures X has EXACTLY the same columns (count and order) as training, preventing feature mismatch errors.
 
 4. Predict:
    {"y_pred = model.fit_predict(X)  # clustering: ALWAYS use fit_predict — DBSCAN/AgglomerativeClustering have no predict()" if is_cluster else "y_pred = model.predict(X)"}
@@ -205,6 +243,8 @@ Output ONLY the Python code."""
             {"role": "user",    "content": prompt},
         ],
     )
+    if response.usage:
+        _tok("testing_agent", response.usage.prompt_tokens, response.usage.completion_tokens)
     code = _strip_markdown(response.choices[0].message.content.strip())
     logger.info("Testing Agent generated code for session %s.", session_id)
     return code
@@ -232,6 +272,8 @@ Fix it. Output ONLY the complete fixed Python code."""
             {"role": "user",   "content": prompt},
         ],
     )
+    if response.usage:
+        _tok("testing_agent", response.usage.prompt_tokens, response.usage.completion_tokens)
     return _strip_markdown(response.choices[0].message.content.strip())
 
 
@@ -274,7 +316,7 @@ def run(
 
     script_name = f"step_test_{session_id or 'default'}.py"
     script_path = GENERATED_CODE_DIR / script_name
-    script_path.write_text(code)
+    script_path.write_text(code, encoding="utf-8")
     logger.info("Written: %s", script_path)
 
     def _fix_callback(stderr: str, stdout: str, attempt: int) -> str:
