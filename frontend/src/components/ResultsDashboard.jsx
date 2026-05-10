@@ -39,7 +39,58 @@ function VerdictBadge({ verdict }) {
   );
 }
 
-export default function ResultsDashboard({ evaluation, algorithmInfo, sessionId }) {
+function ValidationSection({ results }) {
+  const metrics  = results.metrics  || {};
+  const summary  = results.summary  || {};
+  const isClassif = results.task_type?.includes("classif");
+
+  const numericMetrics = Object.entries(metrics).filter(([, v]) => typeof v === "number");
+
+  return (
+    <div className="bg-purple-950/30 border border-purple-700 rounded-xl p-5 space-y-4">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div>
+          <div className="text-purple-300 font-semibold text-base flex items-center gap-2">
+            Held-out Validation Results
+            <span className="text-xs font-normal text-purple-500 bg-purple-900/40 px-2 py-0.5 rounded-full">
+              5% unseen data
+            </span>
+          </div>
+          <p className="text-purple-400 text-sm mt-0.5">
+            {summary.total ?? "?"} rows completely withheld from training
+          </p>
+        </div>
+        {isClassif && summary.accuracy_pct !== undefined && (
+          <div className="flex gap-4 text-sm">
+            <span><span className="text-green-400 font-bold">{summary.correct}</span><span className="text-gray-400"> correct</span></span>
+            <span><span className="text-red-400 font-bold">{summary.wrong}</span><span className="text-gray-400"> wrong</span></span>
+            <span><span className="text-purple-300 font-bold">{summary.accuracy_pct}%</span><span className="text-gray-400"> accuracy</span></span>
+          </div>
+        )}
+      </div>
+
+      {numericMetrics.length > 0 && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          {numericMetrics.map(([k, v]) => (
+            <MetricCard key={k} label={k.toUpperCase()} value={v}
+              highlight={["accuracy", "f1", "r2_score", "silhouette_score"].includes(k.toLowerCase())} />
+          ))}
+        </div>
+      )}
+
+      {metrics.classification_report && (
+        <div className="bg-gray-900 rounded-lg p-3">
+          <div className="text-gray-400 text-xs font-semibold mb-2 uppercase tracking-wide">Classification Report</div>
+          <pre className="text-gray-300 text-xs font-mono overflow-x-auto whitespace-pre">
+            {metrics.classification_report}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function ResultsDashboard({ evaluation, algorithmInfo, sessionId, onTest, validationResults }) {
   if (!evaluation || Object.keys(evaluation).length === 0) return null;
 
   const best = evaluation.best_model || {};
@@ -120,14 +171,27 @@ export default function ResultsDashboard({ evaluation, algorithmInfo, sessionId 
         </div>
       )}
 
-      {/* Download */}
-      <a
-        href={`${API}/download/${sessionId}/model`}
-        download="model.pkl"
-        className="inline-flex items-center gap-2 bg-brand-600 hover:bg-brand-700 text-white font-semibold px-6 py-3 rounded-lg transition-colors"
-      >
-        ⬇ Download model.pkl
-      </a>
+      {/* Validation hold-out results */}
+      {validationResults && <ValidationSection results={validationResults} />}
+
+      {/* Actions */}
+      <div className="flex flex-wrap gap-3">
+        <a
+          href={`${API}/download/${sessionId}/model`}
+          download="model.pkl"
+          className="inline-flex items-center gap-2 bg-brand-600 hover:bg-brand-700 text-white font-semibold px-6 py-3 rounded-lg transition-colors"
+        >
+          ⬇ Download model.pkl
+        </a>
+        {onTest && (
+          <button
+            onClick={onTest}
+            className="inline-flex items-center gap-2 bg-gray-700 hover:bg-gray-600 text-white font-semibold px-6 py-3 rounded-lg transition-colors border border-gray-600"
+          >
+            🧪 Test on New Data
+          </button>
+        )}
+      </div>
     </div>
   );
 }

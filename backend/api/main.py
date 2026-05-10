@@ -27,8 +27,9 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env", override=True)
 
 import csv
+import random
 import aiofiles
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -94,14 +95,43 @@ app.add_middleware(
 
 # ─────────────────────── Session helpers ──────────────────────
 
-def _save_session_meta(session_id: str, dataset_path: str, task_type: str, target_column):
+def _save_session_meta(session_id: str, dataset_path: str, task_type: str, target_column, validation_csv_path: str = ""):
     meta = {
         "session_id": session_id,
         "dataset_path": dataset_path,
         "task_type": task_type,
         "target_column": target_column,
+        "validation_csv_path": validation_csv_path,
     }
     (SESSIONS_DIR / f"{session_id}.json").write_text(json.dumps(meta))
+
+
+def _split_csv_95_5(source_path: Path, train_path: Path, val_path: Path, seed: int = 42) -> tuple[int, int]:
+    """Split a CSV into 95% train / 5% validation rows. Returns (n_train, n_val)."""
+    with open(source_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        rows = list(reader)
+
+    n_val = max(1, int(len(rows) * 0.05))
+    rng = random.Random(seed)
+    val_indices = set(rng.sample(range(len(rows)), n_val))
+
+    with open(train_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        for i, row in enumerate(rows):
+            if i not in val_indices:
+                writer.writerow(row)
+
+    with open(val_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        for i, row in enumerate(rows):
+            if i in val_indices:
+                writer.writerow(row)
+
+    return len(rows) - n_val, n_val
 
 
 def _load_session_meta(session_id: str) -> dict | None:
@@ -126,7 +156,9 @@ def _reconstruct_session(session_id: str) -> dict | None:
         "graph": _shared_graph,
         "config": config,
         "state": create_initial_state(
-            meta["dataset_path"], meta["task_type"], meta.get("target_column")
+            meta["dataset_path"], meta["task_type"], meta.get("target_column"),
+            session_id=session_id,
+            validation_csv_path=meta.get("validation_csv_path", ""),
         ),
         "events_queue": asyncio.Queue(),
         "seen_events": len(last_state.get("events", [])),
@@ -258,7 +290,7 @@ async def health():
 
 
 @app.post("/upload")
-async def upload_dataset(file: UploadFile = File(...)):
+async def upload_dataset(file: UploadFile = File(...), validate: bool = Form(False)):
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
 
@@ -278,23 +310,55 @@ async def upload_dataset(file: UploadFile = File(...)):
     except Exception:
         pass
 
-    logger.info("Uploaded: %s (session %s)", dest, session_id)
-    return {"session_id": session_id, "dataset_path": str(dest), "filename": file.filename, "columns": columns}
+    # 95/5 validation split — overwrite dest with 95%, save 5% separately
+    validation_csv_path = ""
+    n_train = n_val = 0
+    if validate:
+        val_path = UPLOADS_DIR / f"{session_id}_validation.csv"
+        try:
+            n_train, n_val = _split_csv_95_5(dest, dest, val_path)
+            validation_csv_path = str(val_path)
+            logger.info("Split: %d train / %d val rows (session %s)", n_train, n_val, session_id)
+        except Exception as exc:
+            logger.error("CSV split failed: %s", exc, exc_info=True)
+            # Non-fatal — continue without validation
+
+    logger.info("Uploaded: %s (session %s, validate=%s)", dest, session_id, validate)
+    return {
+        "session_id": session_id,
+        "dataset_path": str(dest),
+        "filename": file.filename,
+        "columns": columns,
+        "validate": validate,
+        "validation_split": {"n_train": n_train, "n_val": n_val} if validate else None,
+    }
 
 
 @app.post("/start")
 async def start_pipeline(body: StartRequest):
     session_id = body.session_id
 
-    matches = list(UPLOADS_DIR.glob(f"{session_id}_*"))
+    # Exclude validation and test files from the training dataset match
+    matches = [
+        f for f in UPLOADS_DIR.glob(f"{session_id}_*")
+        if "_validation.csv" not in f.name and "_test_" not in f.name
+    ]
     if not matches:
         raise HTTPException(status_code=404, detail="Dataset not found. Upload first.")
     dataset_path = str(matches[0])
 
-    _save_session_meta(session_id, dataset_path, body.task_type, body.target_column)
+    # Check if a validation hold-out was created at upload time
+    val_path_candidate = UPLOADS_DIR / f"{session_id}_validation.csv"
+    validation_csv_path = str(val_path_candidate) if val_path_candidate.exists() else ""
+
+    _save_session_meta(session_id, dataset_path, body.task_type, body.target_column, validation_csv_path)
 
     config = {"configurable": {"thread_id": session_id}}
-    initial_state = create_initial_state(dataset_path, body.task_type, body.target_column)
+    initial_state = create_initial_state(
+        dataset_path, body.task_type, body.target_column,
+        session_id=session_id,
+        validation_csv_path=validation_csv_path,
+    )
     queue: asyncio.Queue = asyncio.Queue()
 
     sessions[session_id] = {
@@ -319,6 +383,24 @@ async def stream_events(session_id: str):
 
     async def event_generator():
         yield f"data: {json.dumps({'type': 'connected', 'message': 'Connected to pipeline stream'})}\n\n"
+
+        # ── Replay saved events on reconnect ──────────────────────────────────
+        # If the pipeline is paused (awaiting_approval) or finished (completed/failed),
+        # the queue is already drained and the frontend would miss every event emitted
+        # during the first connection (e.g. after a page refresh).
+        # Replay all checkpointed events so the UI rebuilds its state correctly.
+        last_state = session.get("last_state", {})
+        saved_status = last_state.get("status", "")
+        if saved_status in ("awaiting_approval", "completed", "failed"):
+            for evt in last_state.get("events", []):
+                yield f"data: {json.dumps(evt)}\n\n"
+            # Completed/failed pipelines have no more live events — close the stream.
+            if saved_status in ("completed", "failed"):
+                yield f"data: {json.dumps({'type': 'stream_end', 'message': 'Stream ended'})}\n\n"
+                return
+            # awaiting_approval: keep stream open so the post-approval resume events
+            # can flow through the same connection (or the next one opened by approve).
+
         try:
             while True:
                 try:
@@ -403,7 +485,7 @@ async def get_code(session_id: str, step: str):
 @app.get("/download/{session_id}/model")
 async def download_model(session_id: str):
     _get_session(session_id)
-    model_path = OUTPUTS_DIR / "model.pkl"
+    model_path = OUTPUTS_DIR / session_id / "model.pkl"
     if not model_path.exists():
         raise HTTPException(status_code=404, detail="Model not yet trained.")
     return FileResponse(str(model_path), filename="model.pkl", media_type="application/octet-stream")
@@ -412,13 +494,75 @@ async def download_model(session_id: str):
 @app.get("/outputs/{session_id}/plots")
 async def list_plots(session_id: str):
     _get_session(session_id)
-    return {"plots": [p.name for p in OUTPUTS_DIR.glob("*.png")]}
+    plots_dir = OUTPUTS_DIR / session_id / "plots"
+    if not plots_dir.exists():
+        return {"plots": []}
+    return {"plots": [p.name for p in plots_dir.glob("*.png")]}
 
 
 @app.get("/outputs/{session_id}/plot/{filename}")
 async def get_plot(session_id: str, filename: str):
     _get_session(session_id)
-    path = OUTPUTS_DIR / filename
-    if not path.exists() or not filename.endswith(".png"):
+    if not filename.endswith(".png"):
+        raise HTTPException(status_code=400, detail="Only PNG files supported.")
+    path = OUTPUTS_DIR / session_id / "plots" / filename
+    if not path.exists():
         raise HTTPException(status_code=404, detail="Plot not found.")
     return FileResponse(str(path), media_type="image/png")
+
+
+@app.post("/test/{session_id}")
+async def test_model(session_id: str, file: UploadFile = File(...)):
+    """Upload a test CSV, run the trained model on it, return per-row predictions + metrics."""
+    session = _get_session(session_id)
+    last    = session.get("last_state", {})
+
+    task_type     = last.get("task_type", "")
+    target_column = last.get("target_column")
+
+    model_path = OUTPUTS_DIR / session_id / "model.pkl"
+    if not model_path.exists():
+        raise HTTPException(status_code=404, detail="No trained model found. Run the pipeline first.")
+
+    # Save the uploaded test CSV
+    content   = await file.read()
+    test_path = UPLOADS_DIR / f"{session_id}_test_{file.filename}"
+    test_path.write_bytes(content)
+
+    # Retrieve the best working training script for preprocessing reference
+    training_code = ""
+    best_model    = last.get("best_model", {})
+    best_script   = best_model.get("script_path", "")
+    if best_script and Path(best_script).exists():
+        training_code = Path(best_script).read_text()
+    else:
+        for candidate in ["step3_ml.py"]:
+            p = GENERATED_CODE_DIR / candidate
+            if p.exists():
+                training_code = p.read_text()
+                break
+
+    # Run synchronously in thread pool
+    loop = asyncio.get_running_loop()
+
+    def _run():
+        from agents import testing_agent
+        return testing_agent.run(
+            test_csv_path  = str(test_path),
+            model_path     = str(model_path),
+            task_type      = task_type,
+            target_column  = target_column,
+            training_code  = training_code,
+            session_id     = session_id,
+        )
+
+    try:
+        result = await loop.run_in_executor(None, _run)
+    except Exception as exc:
+        logger.error("Test endpoint error for session %s: %s", session_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    if "error" in result:
+        raise HTTPException(status_code=422, detail=result["error"])
+
+    return result

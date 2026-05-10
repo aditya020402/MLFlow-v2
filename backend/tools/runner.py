@@ -7,6 +7,7 @@ import sys
 import os
 import time
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -68,7 +69,7 @@ def get_primary_score(metrics: dict) -> float:
     return 0.0
 
 
-def run_script(script_name: str, timeout: int = 120) -> ExecutionResult:
+def run_script(script_name: str, timeout: int = 300) -> ExecutionResult:
     """Execute a Python script from generated_code/ and capture all output."""
     script_path = GENERATED_CODE_DIR / script_name
     if not script_path.exists():
@@ -142,27 +143,71 @@ def run_script(script_name: str, timeout: int = 120) -> ExecutionResult:
         )
 
 
+def _append_log(log_path: Path, entry: dict) -> None:
+    """Append one execution entry to the session's log.json (creates if missing)."""
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        existing: list = []
+        if log_path.exists():
+            try:
+                existing = json.loads(log_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                existing = []
+        existing.append(entry)
+        log_path.write_text(json.dumps(existing, indent=2, default=str))
+    except Exception as exc:
+        logger.warning("Could not write log.json: %s", exc)
+
+
 def run_script_with_retry(
     script_name: str,
     fix_callback,
     max_retries: int = 10,
-    timeout: int = 120,
+    timeout: int = 300,
+    log_path: Path | None = None,
 ) -> ExecutionResult:
     """Run a script; on failure call fix_callback to get fixed code, rewrite, retry."""
     for attempt in range(1, max_retries + 2):
         result = run_script(script_name, timeout=timeout)
+
+        if log_path:
+            metrics = parse_metrics_from_output(result.stdout) if result.success else {}
+            _append_log(log_path, {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "script": script_name,
+                "attempt": attempt,
+                "success": result.success,
+                "exit_code": result.exit_code,
+                "duration_seconds": round(result.duration_seconds, 2),
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "metrics": metrics,
+            })
+
         if result.success:
             logger.info("Script passed on attempt %d", attempt)
             return result
 
-        logger.warning("Attempt %d failed. stderr: %s", attempt, result.stderr[:500])
+        # The generated except block prints {"error": ...} to stdout (not stderr).
+        # Extract it so the log shows the real error and the fix agent can read it.
+        effective_stderr = result.stderr
+        if not effective_stderr.strip() and result.stdout.strip():
+            try:
+                parsed = json.loads(result.stdout.strip())
+                if "error" in parsed:
+                    effective_stderr = f"[Script exception caught by except block]\n{parsed['error']}"
+            except Exception:
+                # stdout isn't JSON; show the first 500 chars as-is
+                effective_stderr = result.stdout[:500]
+
+        logger.warning("Attempt %d failed. error: %s", attempt, effective_stderr[:500])
 
         if attempt > max_retries:
             logger.error("Max retries reached.")
             return result
 
         logger.info("Requesting fix from agent (attempt %d/%d)...", attempt, max_retries)
-        fixed_code = fix_callback(result.stderr, result.stdout, attempt)
+        fixed_code = fix_callback(effective_stderr, result.stdout, attempt)
         if fixed_code:
             script_path = GENERATED_CODE_DIR / script_name
             script_path.write_text(fixed_code)

@@ -7,6 +7,7 @@ export default function UploadScreen({ onStart }) {
   const [columns, setColumns] = useState([]);
   const [taskType, setTaskType] = useState("supervised_classification");
   const [targetColumn, setTargetColumn] = useState("");
+  const [validate, setValidate] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
   const inputRef = useRef();
@@ -55,6 +56,7 @@ export default function UploadScreen({ onStart }) {
     try {
       const form = new FormData();
       form.append("file", file);
+      form.append("validate", validate ? "true" : "false");
       const uploadRes = await fetch(`${API}/upload`, { method: "POST", body: form });
       if (!uploadRes.ok) throw new Error(await uploadRes.text());
       const { session_id } = await uploadRes.json();
@@ -131,6 +133,27 @@ export default function UploadScreen({ onStart }) {
             <option value="unsupervised">Unsupervised — Clustering</option>
           </select>
         </div>
+
+        {/* Validation hold-out */}
+        <label className="flex items-start gap-3 cursor-pointer select-none group">
+          <div className="mt-0.5">
+            <input
+              type="checkbox"
+              checked={validate}
+              onChange={(e) => setValidate(e.target.checked)}
+              className="w-4 h-4 rounded accent-brand-500 cursor-pointer"
+            />
+          </div>
+          <div>
+            <span className="text-sm font-medium text-gray-300 group-hover:text-white transition-colors">
+              Validate model on held-out data
+            </span>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Reserves 5% of your CSV before training begins. Once the best model is found,
+              the validation agent automatically scores it on this unseen data.
+            </p>
+          </div>
+        </label>
 
         {/* Target column — dropdown if columns parsed, fallback text input */}
         {taskType !== "unsupervised" && (

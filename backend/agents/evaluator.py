@@ -1,14 +1,13 @@
 import logging
 import json
 from pathlib import Path
-from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
 OUTPUTS_DIR = Path(__file__).parent.parent / "outputs"
 
-client = OpenAI()
-MODEL = "gpt-4o"
+from agents.llm_client import client, MODEL
+from agents.token_tracker import record as _tok
 
 SYSTEM_PROMPT = """You are an expert ML Model Evaluation Agent.
 Analyze model performance metrics and provide a structured evaluation.
@@ -69,6 +68,8 @@ Output ONLY the JSON object."""
         ],
     )
 
+    if response.usage:
+        _tok("evaluator", response.usage.prompt_tokens, response.usage.completion_tokens)
     text = response.choices[0].message.content.strip()
     if text.startswith("```"):
         lines = text.split("\n")[1:]
