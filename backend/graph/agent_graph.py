@@ -20,15 +20,25 @@ import os
 import shutil
 import sqlite3
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Optional, TypedDict, Literal
+
+# Suppress LangGraph's pending deprecation warning about JsonPlusSerializer.allowed_objects
+# — the parameter is internal to SqliteSaver and cannot be passed by callers.
+warnings.filterwarnings(
+    "ignore",
+    message=".*allowed_objects.*",
+    category=DeprecationWarning,
+)
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from agents import data_understanding, data_analyst, ml_engineer, evaluator, optimizer
+from agents import data_understanding, task_profiler, data_analyst, ml_engineer, evaluator, optimizer
+from agents.token_tracker import set_session as _set_session, get as _get_token_usage
 from tools.runner import run_script_with_retry, parse_metrics_from_output, get_primary_score
 
 logger = logging.getLogger(__name__)
@@ -60,17 +70,24 @@ class PipelineState(TypedDict):
     task_type: str          # supervised_classification | supervised_regression | unsupervised
     target_column: Optional[str]
 
-    # ── Step 1 — Data Understanding ──
+    # ── Step 1a — General Data Understanding ──
     understanding_code: str
-    understanding_output: str
+    understanding_output: str   # JSON from step1a_general.py
     understanding_error: str
     understanding_retries: int
+
+    # ── Step 1b — Task-Specific Profiling ──
+    profiling_code: str
+    profiling_output: str       # JSON from step1b_profiling.py
+    profiling_error: str
+    profiling_retries: int
 
     # ── Step 2 — Data Analysis ──
     analysis_code: str
     analysis_output: str
     analysis_error: str
     analysis_retries: int
+    analysis_data: dict     # parsed JSON from analysis script — col types, encoding recs, imbalance, etc.
 
     # ── Human approval gate ──
     human_approved: bool
@@ -106,6 +123,13 @@ class PipelineState(TypedDict):
 
     # ── UI streaming events ──
     events: list
+
+    # ── Validation (optional 5% hold-out) ──
+    validation_csv_path: str  # path to held-out validation CSV, or ""
+    validation_results: dict  # populated by node_evaluation after running testing_agent
+
+    # ── Token usage ──
+    token_usage: dict
 
     # ── Final status ──
     status: str     # running | awaiting_approval | completed | failed
@@ -168,7 +192,8 @@ def _try_parse_json(text: str) -> dict:
 # ─────────────────────────── Nodes ────────────────────────────
 
 def node_data_understanding(state: PipelineState) -> PipelineState:
-    events = _emit(state, "agent_thinking", "Data Understanding Agent is generating code...")
+    _set_session(state["session_id"])
+    events = _emit(state, "agent_thinking", "General Understanding Agent computing universal dataset metrics...")
 
     result = data_understanding.run(
         dataset_path=state["dataset_path"],
@@ -178,38 +203,87 @@ def node_data_understanding(state: PipelineState) -> PipelineState:
 
     events = _emit(
         {"events": events}, "code_generated",
-        "step1_understanding.py written.", data=result["code"],
+        "step1a_general.py written.", data=result["code"],
     )
     return {**state, "understanding_code": result["code"], "events": events, "understanding_retries": 0}
 
 
 def node_execute_understanding(state: PipelineState) -> PipelineState:
+    _set_session(state["session_id"])
     retries = state.get("understanding_retries", 0)
-    events = _emit(state, "executing", f"Running step1_understanding.py (attempt {retries + 1})...")
+    events = _emit(state, "executing", f"Running step1a_general.py (attempt {retries + 1})...")
 
-    script_path = GENERATED_CODE_DIR / "step1_understanding.py"
+    script_path = GENERATED_CODE_DIR / "step1a_general.py"
+    _session_log = OUTPUTS_DIR / (state.get("session_id") or "default") / "log.json"
     result = run_script_with_retry(
-        "step1_understanding.py",
+        "step1a_general.py",
         fix_callback=data_understanding.make_fix_callback(script_path),
         max_retries=MAX_RETRIES,
+        log_path=_session_log,
     )
 
     if result.success:
-        events = _emit({"events": events}, "execution_success", "step1 succeeded.", data=result.stdout[:3000])
+        events = _emit({"events": events}, "execution_success", "General understanding complete.", data=result.stdout[:3000])
+        understanding_parsed = _try_parse_json(result.stdout)
+        if understanding_parsed:
+            events = _emit({"events": events}, "understanding_data", "Understanding data ready.", data=understanding_parsed)
         return {**state, "understanding_output": result.stdout, "understanding_error": "", "events": events}
 
-    events = _emit({"events": events}, "execution_error", f"step1 failed after {MAX_RETRIES} retries.", data=result.stderr)
+    events = _emit({"events": events}, "execution_error", f"General understanding failed after {MAX_RETRIES} retries.", data=result.stderr)
     return {**state, "understanding_output": "", "understanding_error": result.stderr, "status": "failed", "events": events}
 
 
+def node_task_profiling(state: PipelineState) -> PipelineState:
+    _set_session(state["session_id"])
+    events = _emit(state, "agent_thinking",
+                   f"Task Profiling Agent computing {state['task_type']}-specific metrics...")
+
+    result = task_profiler.run(
+        dataset_path=state["dataset_path"],
+        task_type=state["task_type"],
+        target_column=state.get("target_column"),
+        general_output=state.get("understanding_output", ""),
+    )
+
+    events = _emit({"events": events}, "code_generated", "step1b_profiling.py written.", data=result["code"])
+    return {**state, "profiling_code": result["code"], "events": events, "profiling_retries": 0}
+
+
+def node_execute_profiling(state: PipelineState) -> PipelineState:
+    _set_session(state["session_id"])
+    retries = state.get("profiling_retries", 0)
+    events = _emit(state, "executing", f"Running step1b_profiling.py (attempt {retries + 1})...")
+
+    script_path = GENERATED_CODE_DIR / "step1b_profiling.py"
+    _session_log = OUTPUTS_DIR / (state.get("session_id") or "default") / "log.json"
+    result = run_script_with_retry(
+        "step1b_profiling.py",
+        fix_callback=task_profiler.make_fix_callback(script_path),
+        max_retries=MAX_RETRIES,
+        log_path=_session_log,
+    )
+
+    if result.success:
+        events = _emit({"events": events}, "execution_success", "Task profiling complete.", data=result.stdout[:3000])
+        profiling_parsed = _try_parse_json(result.stdout)
+        if profiling_parsed:
+            events = _emit({"events": events}, "profiling_data", "Profiling data ready.", data=profiling_parsed)
+        return {**state, "profiling_output": result.stdout, "profiling_error": "", "events": events}
+
+    events = _emit({"events": events}, "execution_error", f"Task profiling failed after {MAX_RETRIES} retries.", data=result.stderr)
+    return {**state, "profiling_output": "", "profiling_error": result.stderr, "status": "failed", "events": events}
+
+
 def node_data_analysis(state: PipelineState) -> PipelineState:
-    events = _emit(state, "agent_thinking", "Data Analyst Agent is generating code...")
+    _set_session(state["session_id"])
+    events = _emit(state, "agent_thinking", "Data Analyst Agent generating cleaning and analysis code...")
 
     result = data_analyst.run(
         dataset_path=state["dataset_path"],
-        understanding_output=state["understanding_output"],
         task_type=state["task_type"],
         target_column=state.get("target_column"),
+        general_output=state.get("understanding_output", ""),
+        profiling_output=state.get("profiling_output", ""),
         session_id=state.get("session_id", ""),
     )
 
@@ -218,14 +292,17 @@ def node_data_analysis(state: PipelineState) -> PipelineState:
 
 
 def node_execute_analysis(state: PipelineState) -> PipelineState:
+    _set_session(state["session_id"])
     retries = state.get("analysis_retries", 0)
     events = _emit(state, "executing", f"Running step2_analysis.py (attempt {retries + 1})...")
 
     script_path = GENERATED_CODE_DIR / "step2_analysis.py"
+    _session_log = OUTPUTS_DIR / (state.get("session_id") or "default") / "log.json"
     result = run_script_with_retry(
         "step2_analysis.py",
         fix_callback=data_analyst.make_fix_callback(script_path),
         max_retries=MAX_RETRIES,
+        log_path=_session_log,
     )
 
     if result.success:
@@ -251,6 +328,7 @@ def node_execute_analysis(state: PipelineState) -> PipelineState:
             **state,
             "dataset_path":   cleaned_path,
             "analysis_output": result.stdout,
+            "analysis_data":   analysis_data or {},
             "analysis_error":  "",
             "status":          "awaiting_approval",
             "events":          events,
@@ -272,16 +350,23 @@ def node_human_approval(state: PipelineState) -> PipelineState:
 
 
 def node_ml_engineering(state: PipelineState) -> PipelineState:
+    _set_session(state["session_id"])
     events = _emit(state, "agent_thinking", "ML Engineer Agent is selecting algorithm and generating baseline code...")
 
     current_tried = list(state.get("tried_algorithms", []))
 
+    _understanding = (
+        state.get("understanding_output", "") +
+        "\n\n=== TASK-SPECIFIC PROFILE ===\n" +
+        state.get("profiling_output", "")
+    )
     result = ml_engineer.run(
         dataset_path=state["dataset_path"],
         task_type=state["task_type"],
         target_column=state.get("target_column", ""),
-        understanding_output=state["understanding_output"],
+        understanding_output=_understanding,
         analysis_output=state["analysis_output"],
+        analysis_data=state.get("analysis_data", {}),
         human_feedback=state.get("human_feedback", ""),
         tried_algorithms=current_tried,
         session_id=state.get("session_id", ""),
@@ -310,14 +395,17 @@ def node_ml_engineering(state: PipelineState) -> PipelineState:
 
 
 def node_execute_ml(state: PipelineState) -> PipelineState:
+    _set_session(state["session_id"])
     retries = state.get("ml_retries", 0)
     events = _emit(state, "executing", f"Running step3_ml.py — baseline (attempt {retries + 1})...")
 
     script_path = GENERATED_CODE_DIR / "step3_ml.py"
+    _session_log = OUTPUTS_DIR / (state.get("session_id") or "default") / "log.json"
     result = run_script_with_retry(
         "step3_ml.py",
         fix_callback=ml_engineer.make_fix_callback(script_path),
         max_retries=MAX_RETRIES,
+        log_path=_session_log,
     )
 
     if result.success:
@@ -395,6 +483,7 @@ def node_optimizer(state: PipelineState) -> PipelineState:
       - tune count exhausted, models_tried < MAX_OPTIMIZATION_LOOPS  →  new_algorithm (Path B)
     The LLM is only asked for *what* to do (search space / which new algo), not *whether* to tune.
     """
+    _set_session(state["session_id"])
     next_iter = state.get("optimization_iteration", 0) + 1
     current_tune = state.get("current_algo_tune_count", 0)
     current_models = state.get("models_tried", 0)
@@ -407,13 +496,18 @@ def node_optimizer(state: PipelineState) -> PipelineState:
 
     current_tried = list(state.get("tried_algorithms", []))
 
+    _understanding = (
+        state.get("understanding_output", "") +
+        "\n\n=== TASK-SPECIFIC PROFILE ===\n" +
+        state.get("profiling_output", "")
+    )
     result = optimizer.run(
         dataset_path=state["dataset_path"],
         task_type=state["task_type"],
         target_column=state.get("target_column", ""),
         iteration=next_iter,
         optimization_history=state.get("optimization_history", []),
-        understanding_output=state.get("understanding_output", ""),
+        understanding_output=_understanding,
         best_model=state.get("best_model", {}),
         current_algo_tune_count=current_tune,
         models_tried=current_models,
@@ -422,6 +516,7 @@ def node_optimizer(state: PipelineState) -> PipelineState:
         last_working_code=state.get("last_opt_working_code", ""),
         current_algorithm=state.get("current_algorithm", ""),
         session_id=state.get("session_id", ""),
+        analysis_data=state.get("analysis_data", {}),
     )
 
     algo_info = result["algorithm_info"]
@@ -470,6 +565,7 @@ def node_optimizer(state: PipelineState) -> PipelineState:
 
 def node_execute_optimization(state: PipelineState) -> PipelineState:
     """Execute the current optimization iteration script."""
+    _set_session(state["session_id"])
     script_name = state.get("opt_script_name", "")
     iteration = state.get("optimization_iteration", 1)
 
@@ -482,10 +578,12 @@ def node_execute_optimization(state: PipelineState) -> PipelineState:
     events = _emit(state, "executing", f"Running {script_name} (iteration {iteration})...")
 
     script_path = GENERATED_CODE_DIR / script_name
+    _session_log = OUTPUTS_DIR / (state.get("session_id") or "default") / "log.json"
     result = run_script_with_retry(
         script_name,
         fix_callback=optimizer.make_fix_callback(script_path),
         max_retries=MAX_RETRIES,
+        log_path=_session_log,
     )
 
     if result.success:
@@ -539,6 +637,7 @@ def node_finalize_best(state: PipelineState) -> PipelineState:
 
 
 def node_evaluation(state: PipelineState) -> PipelineState:
+    _set_session(state["session_id"])
     events = _emit(state, "agent_thinking", "Evaluation Agent is analyzing best model performance...")
 
     best = state.get("best_model", {})
@@ -562,15 +661,61 @@ def node_evaluation(state: PipelineState) -> PipelineState:
         f"Evaluation complete. Verdict: {verdict.upper()} | Score: {score:.3f}",
         data={**evaluation, "best_model": best, "optimization_history": state.get("optimization_history", [])},
     )
+    # ── Collect token usage BEFORE completed so the frontend stream is still open ──
+    session_id = state.get("session_id", "default")
+    token_usage = _get_token_usage(session_id)
+    if token_usage:
+        events = _emit({"events": events}, "token_usage", "Token usage summary ready.", data=token_usage)
+
+    # ── Auto-validation on held-out 5% ───────────────────────────────
+    val_csv = state.get("validation_csv_path", "")
+    if val_csv and Path(val_csv).exists():
+        events = _emit({"events": events}, "agent_thinking",
+                       "Running validation agent on held-out 5% data...")
+        try:
+            from agents import testing_agent as _ta
+            model_path = str(OUTPUTS_DIR / session_id / "model.pkl")
+            training_code = state.get("last_opt_working_code", "")
+            val_result = _ta.run(
+                test_csv_path=val_csv,
+                model_path=model_path,
+                task_type=state["task_type"],
+                target_column=state.get("target_column"),
+                training_code=training_code,
+                session_id=session_id + "_val",
+            )
+            if "error" not in val_result:
+                events = _emit({"events": events}, "validation_results",
+                               "Held-out validation complete.", data=val_result)
+                logger.info("Validation complete for session %s", session_id)
+            else:
+                _err_msg = val_result.get("error", "unknown")
+                val_result = {}
+                events = _emit({"events": events}, "validation_error",
+                               f"Validation failed: {_err_msg}")
+        except Exception as exc:
+            val_result = {}
+            logger.error("Validation agent error: %s", exc, exc_info=True)
+            events = _emit({"events": events}, "validation_error",
+                           f"Validation agent error: {exc}")
+    else:
+        val_result = {}
+
+    # ── completed must be last — frontend closes the SSE stream on this event ──
     events = _emit({"events": events}, "completed", "Pipeline finished successfully!")
 
-    return {**state, "evaluation": evaluation, "status": "completed", "events": events}
+    return {**state, "evaluation": evaluation, "token_usage": token_usage,
+            "validation_results": val_result, "status": "completed", "events": events}
 
 
 # ─────────────────────────── Edges ────────────────────────────
 
-def edge_after_understanding_exec(state: PipelineState) -> Literal["data_analysis", "__end__"]:
-    return "__end__" if state.get("understanding_error") else "data_analysis"
+def edge_after_understanding_exec(state: PipelineState) -> Literal["task_profiling", "__end__"]:
+    return "__end__" if state.get("understanding_error") else "task_profiling"
+
+
+def edge_after_profiling_exec(state: PipelineState) -> Literal["data_analysis", "__end__"]:
+    return "__end__" if state.get("profiling_error") else "data_analysis"
 
 
 def edge_after_analysis_exec(state: PipelineState) -> Literal["human_approval", "__end__"]:
@@ -609,6 +754,8 @@ def _build_workflow():
 
     workflow.add_node("data_understanding",     node_data_understanding)
     workflow.add_node("execute_understanding",  node_execute_understanding)
+    workflow.add_node("task_profiling",         node_task_profiling)
+    workflow.add_node("execute_profiling",      node_execute_profiling)
     workflow.add_node("data_analysis",          node_data_analysis)
     workflow.add_node("execute_analysis",       node_execute_analysis)
     workflow.add_node("human_approval",         node_human_approval)
@@ -627,6 +774,12 @@ def _build_workflow():
     workflow.add_conditional_edges(
         "execute_understanding",
         edge_after_understanding_exec,
+        {"task_profiling": "task_profiling", "__end__": END},
+    )
+    workflow.add_edge("task_profiling", "execute_profiling")
+    workflow.add_conditional_edges(
+        "execute_profiling",
+        edge_after_profiling_exec,
         {"data_analysis": "data_analysis", "__end__": END},
     )
     workflow.add_edge("data_analysis", "execute_analysis")
@@ -679,7 +832,8 @@ graph = build_graph()
 
 
 def create_initial_state(
-    dataset_path: str, task_type: str, target_column: str = None, session_id: str = ""
+    dataset_path: str, task_type: str, target_column: str = None, session_id: str = "",
+    validation_csv_path: str = "",
 ) -> PipelineState:
     return PipelineState(
         session_id=session_id,
@@ -690,10 +844,15 @@ def create_initial_state(
         understanding_output="",
         understanding_error="",
         understanding_retries=0,
+        profiling_code="",
+        profiling_output="",
+        profiling_error="",
+        profiling_retries=0,
         analysis_code="",
         analysis_output="",
         analysis_error="",
         analysis_retries=0,
+        analysis_data={},
         human_approved=False,
         human_feedback="",
         ml_code="",
@@ -717,5 +876,7 @@ def create_initial_state(
         last_opt_working_code="",
         evaluation={},
         events=[],
+        token_usage={},
         status="running",
+        validation_csv_path=validation_csv_path,
     )

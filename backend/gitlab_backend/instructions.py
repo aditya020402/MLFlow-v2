@@ -34,6 +34,7 @@ def parse(body: str) -> dict:
         "raw":                  body,
         "task_type":            None,
         "target_column":        None,
+        "validate":             False,
         "dataset_description":  "",
         "data_notes":           [],
         "ml_requirements":      [],
@@ -74,6 +75,10 @@ def parse(body: str) -> dict:
         elif "ml requirements" in heading or "requirements" in heading:
             items = re.findall(r"^[-*]\s+(.+)$", content, re.MULTILINE)
             result["ml_requirements"] = items or [content] if content else []
+
+        elif "validation" in heading:
+            raw_val = content.split("\n")[0].strip().lower()
+            result["validate"] = raw_val in {"yes", "true", "enabled", "on", "1"}
 
         elif "evaluation" in heading:
             m = re.search(r"primary\s+metric\s*[:\-]\s*(\w+)", content, re.I)

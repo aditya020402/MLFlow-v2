@@ -42,25 +42,25 @@ function PlotImage({ sessionId, filename }) {
 
 export default function AnalysisTab({ sessionId, analysisData, ready }) {
   const [plots, setPlots] = useState([]);
-  const [fetchedPlots, setFetchedPlots] = useState(false);
+  const [fetchingPlots, setFetchingPlots] = useState(false);
+
+  const loadPlots = async () => {
+    setFetchingPlots(true);
+    try {
+      const res = await fetch(`${API}/outputs/${sessionId}/plots`);
+      if (res.ok) {
+        const { plots: list } = await res.json();
+        setPlots(list || []);
+      }
+    } catch (_) {}
+    setFetchingPlots(false);
+  };
 
   // Fetch plot list once analysis is ready and tab mounts
   useEffect(() => {
-    if (!ready || fetchedPlots) return;
-
-    const load = async () => {
-      try {
-        const res = await fetch(`${API}/outputs/${sessionId}/plots`);
-        if (res.ok) {
-          const { plots: list } = await res.json();
-          setPlots(list || []);
-        }
-      } catch (_) {}
-      setFetchedPlots(true);
-    };
-
-    load();
-  }, [ready, sessionId, fetchedPlots]);
+    if (!ready) return;
+    loadPlots();
+  }, [ready, sessionId]);
 
   if (!ready) {
     return (
@@ -73,16 +73,31 @@ export default function AnalysisTab({ sessionId, analysisData, ready }) {
   return (
     <div className="space-y-8">
       {/* ── Plots ─────────────────────────────────────────────── */}
-      {plots.length > 0 && (
+      {(plots.length > 0 || ready) && (
         <section className="space-y-4">
-          <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">
-            Generated Plots
-          </h3>
-          <div className="grid md:grid-cols-2 gap-6">
-            {plots.map((f) => (
-              <PlotImage key={f} sessionId={sessionId} filename={f} />
-            ))}
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">
+              Generated Plots {plots.length > 0 && `(${plots.length})`}
+            </h3>
+            <button
+              onClick={loadPlots}
+              disabled={fetchingPlots}
+              className="text-xs text-gray-400 hover:text-white border border-gray-700 hover:border-gray-500 px-3 py-1 rounded-lg transition-colors disabled:opacity-40"
+            >
+              {fetchingPlots ? "Refreshing…" : "↺ Refresh"}
+            </button>
           </div>
+          {plots.length > 0 ? (
+            <div className="grid md:grid-cols-2 gap-6">
+              {plots.map((f) => (
+                <PlotImage key={f} sessionId={sessionId} filename={f} />
+              ))}
+            </div>
+          ) : (
+            <div className="text-gray-600 text-sm italic text-center py-6 border border-dashed border-gray-700 rounded-xl">
+              No plots found — click Refresh if the analysis just completed.
+            </div>
+          )}
         </section>
       )}
 

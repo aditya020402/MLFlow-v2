@@ -1,20 +1,24 @@
 import { useEffect, useRef } from "react";
 
 const EVENT_STYLES = {
-  agent_thinking:    { icon: "🧠", color: "text-purple-400",  bg: "bg-purple-950/40" },
-  code_generated:    { icon: "📝", color: "text-blue-400",    bg: "bg-blue-950/40"   },
-  executing:         { icon: "⚙️", color: "text-yellow-400",  bg: "bg-yellow-950/30" },
-  execution_success: { icon: "✅", color: "text-green-400",   bg: "bg-green-950/40"  },
-  execution_error:   { icon: "❌", color: "text-red-400",     bg: "bg-red-950/40"    },
-  awaiting_approval: { icon: "⏸️", color: "text-orange-400", bg: "bg-orange-950/40" },
-  approved:          { icon: "▶️", color: "text-green-400",   bg: "bg-green-950/40"  },
-  algorithm_selected:{ icon: "🎯", color: "text-cyan-400",    bg: "bg-cyan-950/40"   },
-  evaluation_done:   { icon: "📊", color: "text-teal-400",    bg: "bg-teal-950/40"   },
-  completed:         { icon: "🏁", color: "text-green-300",   bg: "bg-green-950/40"  },
-  error:             { icon: "💥", color: "text-red-400",     bg: "bg-red-950/40"    },
-  heartbeat:         { icon: "💓", color: "text-gray-600",    bg: ""                 },
-  connected:         { icon: "🔗", color: "text-gray-400",    bg: ""                 },
-  stream_end:        { icon: "⏹️", color: "text-gray-400",    bg: ""                 },
+  agent_thinking:     { icon: "🧠", color: "text-purple-400",  bg: "bg-purple-950/40" },
+  code_generated:     { icon: "📝", color: "text-blue-400",    bg: "bg-blue-950/40"   },
+  executing:          { icon: "⚙️", color: "text-yellow-400",  bg: "bg-yellow-950/30" },
+  execution_success:  { icon: "✅", color: "text-green-400",   bg: "bg-green-950/40"  },
+  execution_error:    { icon: "❌", color: "text-red-400",     bg: "bg-red-950/40"    },
+  awaiting_approval:  { icon: "⏸️", color: "text-orange-400", bg: "bg-orange-950/40" },
+  approved:           { icon: "▶️", color: "text-green-400",   bg: "bg-green-950/40"  },
+  algorithm_selected: { icon: "🎯", color: "text-cyan-400",    bg: "bg-cyan-950/40"   },
+  algorithm_rationale:{ icon: "💭", color: "text-cyan-300",    bg: ""                 },
+  best_model_updated: { icon: "🏆", color: "text-yellow-300",  bg: "bg-yellow-950/30" },
+  iteration_tracked:  { icon: "📈", color: "text-gray-400",    bg: ""                 },
+  optimization_complete:{ icon: "⚙️", color: "text-indigo-400", bg: "bg-indigo-950/30"},
+  evaluation_done:    { icon: "📊", color: "text-teal-400",    bg: "bg-teal-950/40"   },
+  completed:          { icon: "🏁", color: "text-green-300",   bg: "bg-green-950/40"  },
+  error:              { icon: "💥", color: "text-red-400",     bg: "bg-red-950/40"    },
+  heartbeat:          { icon: "💓", color: "text-gray-600",    bg: ""                 },
+  connected:          { icon: "🔗", color: "text-gray-400",    bg: ""                 },
+  stream_end:         { icon: "⏹️", color: "text-gray-400",    bg: ""                 },
 };
 
 export default function AgentConsole({ events, isRunning }) {
@@ -48,6 +52,45 @@ export default function AgentConsole({ events, isRunning }) {
         {events.map((evt, i) => {
           const style = EVENT_STYLES[evt.type] || { icon: "•", color: "text-gray-400", bg: "" };
           if (evt.type === "heartbeat") return null;
+
+          // Rationale events render as an indented quote block under the algorithm_selected row
+          if (evt.type === "algorithm_rationale") {
+            return (
+              <div key={i} className="ml-8 pl-3 border-l-2 border-cyan-800/60 py-1">
+                <p className="text-xs text-cyan-300/80 italic leading-relaxed">{evt.message}</p>
+              </div>
+            );
+          }
+
+          // Best model updates show score prominently
+          if (evt.type === "best_model_updated" && evt.data) {
+            const score = evt.data.primary_score?.toFixed(4);
+            const metric = evt.data.primary_metric;
+            const algo = evt.data.algorithm;
+            const iter = evt.data.iteration;
+            return (
+              <div key={i} className={`flex gap-2 items-start rounded-lg px-3 py-2 ${style.bg}`}>
+                <span className="text-base shrink-0">{style.icon}</span>
+                <div className="flex-1 min-w-0">
+                  <span className={`text-sm font-semibold ${style.color}`}>
+                    New best — iter {iter}: {algo}
+                  </span>
+                  <span className="text-xs text-yellow-200/70 ml-2">{metric} = {score}</span>
+                </div>
+              </div>
+            );
+          }
+
+          // iteration_tracked is low-signal — show compact
+          if (evt.type === "iteration_tracked") {
+            return (
+              <div key={i} className="flex gap-2 items-center px-3 py-1">
+                <span className="text-xs shrink-0 text-gray-500">{style.icon}</span>
+                <span className="text-xs text-gray-500">{evt.message}</span>
+              </div>
+            );
+          }
+
           return (
             <div key={i} className={`flex gap-2 items-start rounded-lg px-3 py-2 ${style.bg}`}>
               <span className="text-base shrink-0">{style.icon}</span>

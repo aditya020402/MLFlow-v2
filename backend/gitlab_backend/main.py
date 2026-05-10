@@ -322,6 +322,7 @@ def _run_issue_pipeline(
             human_feedback = parsed["human_feedback"],
             session_id     = session_id,
             progress_cb    = post,
+            validate       = parsed.get("validate", False),
         )
 
         # ── Upload results ──────────────────────────────────────────────
@@ -353,8 +354,9 @@ def _upload_and_summarise(
     session_id: str,
     final_state: dict,
 ):
-    model_link      = ""
-    history_link    = ""
+    model_link   = ""
+    history_link = ""
+    plot_links   = []
 
     session_out = OUTPUTS_DIR / session_id
 
@@ -376,11 +378,29 @@ def _upload_and_summarise(
         except Exception as exc:
             logger.warning("history upload failed: %s", exc)
 
-    evaluation = final_state.get("evaluation", {})
-    best       = final_state.get("best_model", {})
-    history    = final_state.get("optimization_history", [])
+    # Upload up to 4 generated plots and embed them in the comment
+    plots_dir = session_out / "plots"
+    if plots_dir.exists():
+        pngs = sorted(plots_dir.glob("*.png"))[:4]
+        for png in pngs:
+            try:
+                up = client.upload_file(png)
+                plot_links.append((png.name, up.get("url", ""), up.get("markdown", "")))
+                logger.info("Uploaded plot: %s", png.name)
+            except Exception as exc:
+                logger.warning("Plot upload failed (%s): %s", png.name, exc)
 
-    comment = _results_comment(evaluation, best, history, model_link, history_link, session_id)
+    evaluation        = final_state.get("evaluation", {})
+    best              = final_state.get("best_model", {})
+    history           = final_state.get("optimization_history", [])
+    analysis_data     = final_state.get("analysis_data", {})
+    token_usage       = final_state.get("token_usage", {})
+    validation_results = final_state.get("validation_results", {})
+
+    comment = _results_comment(
+        evaluation, best, history, model_link, history_link,
+        session_id, plot_links, analysis_data, token_usage, validation_results,
+    )
     client.post_comment(issue_iid, comment)
 
 
@@ -391,6 +411,10 @@ def _results_comment(
     model_link: str,
     history_link: str,
     session_id: str,
+    plot_links: list | None = None,
+    analysis_data: dict | None = None,
+    token_usage: dict | None = None,
+    validation_results: dict | None = None,
 ) -> str:
     verdict = evaluation.get("verdict", "unknown").upper()
     verdict_icon = "✅" if verdict == "PASS" else "⚠️"
@@ -436,6 +460,107 @@ def _results_comment(
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+    # ── Analysis insights block ────────────────────────────────────────────
+    analysis_data = analysis_data or {}
+    plot_insights = analysis_data.get("plot_insights", [])
+    ml_recs       = analysis_data.get("ml_model_recommendations", {})
+
+    insights_section = ""
+    if plot_insights:
+        bullet_insights = "\n".join(f"- {i}" for i in plot_insights)
+        insights_section = f"\n### Data Insights\n\n{bullet_insights}\n"
+
+    ml_recs_section = ""
+    algo_hints   = ml_recs.get("algorithm_hints", [])
+    challenges   = ml_recs.get("expected_challenges", [])
+    if algo_hints or challenges:
+        lines = []
+        if algo_hints:
+            lines.append("**Algorithm reasoning:** " + " ".join(algo_hints[:2]))
+        if challenges:
+            challenges_md = "\n".join(f"- {c}" for c in challenges)
+            lines.append(f"**Challenges addressed:**\n{challenges_md}")
+        ml_recs_section = "\n### Analyst Recommendations\n\n" + "\n\n".join(lines) + "\n"
+
+    # ── Token usage section ────────────────────────────────────────────────
+    token_usage = token_usage or {}
+    token_section = ""
+    if token_usage:
+        total_in  = token_usage.get("input_tokens", 0)
+        total_out = token_usage.get("output_tokens", 0)
+        total_all = token_usage.get("total_tokens", 0)
+        by_agent  = token_usage.get("by_agent", {})
+        agent_rows = "\n".join(
+            f"| `{agent}` | {s['input']:,} | {s['output']:,} | {s['total']:,} | {s['calls']} |"
+            for agent, s in by_agent.items()
+        )
+        agent_table = (
+            "| Agent | Input | Output | Total | Calls |\n"
+            "|-------|-------|--------|-------|-------|\n"
+            + agent_rows
+        ) if agent_rows else ""
+        token_section = (
+            f"\n### Token Usage\n\n"
+            f"**Total:** {total_in:,} input + {total_out:,} output = **{total_all:,} tokens**\n\n"
+            + (agent_table + "\n" if agent_table else "")
+        )
+
+    # ── Validation section ─────────────────────────────────────────────────
+    validation_results = validation_results or {}
+    validation_section = ""
+    if validation_results and "error" not in validation_results:
+        vmetrics  = validation_results.get("metrics", {})
+        vsummary  = validation_results.get("summary", {})
+        vtask     = validation_results.get("task_type", "")
+        vhas      = validation_results.get("has_actual_labels", False)
+
+        val_lines = []
+        if vhas and vmetrics:
+            for k, v in vmetrics.items():
+                if k == "classification_report":
+                    continue
+                if isinstance(v, float):
+                    val_lines.append(f"| {k.upper()} | {v:.4f} |")
+                elif isinstance(v, (int, str)):
+                    val_lines.append(f"| {k.upper()} | {v} |")
+        elif not vhas:
+            for k, v in vmetrics.items():
+                if isinstance(v, float):
+                    val_lines.append(f"| {k.upper()} | {v:.4f} |")
+
+        total = vsummary.get("total", "?")
+        if "classif" in vtask and vhas:
+            correct = vsummary.get("correct", "?")
+            wrong   = vsummary.get("wrong", "?")
+            pct     = vsummary.get("accuracy_pct", "?")
+            summary_line = f"**Samples:** {total} | **Correct:** {correct} | **Wrong:** {wrong} | **Accuracy:** {pct}%"
+        else:
+            summary_line = f"**Samples:** {total}"
+
+        val_table = (
+            "| Metric | Value |\n|--------|-------|\n" + "\n".join(val_lines)
+            if val_lines else "_Unsupervised — no ground-truth metrics._"
+        )
+
+        cr = vmetrics.get("classification_report", "")
+        cr_block = f"\n\n<details><summary>Classification Report</summary>\n\n```\n{cr}\n```\n</details>" if cr else ""
+
+        validation_section = (
+            f"\n### Held-Out Validation (5%)\n\n"
+            f"{summary_line}\n\n"
+            f"{val_table}"
+            f"{cr_block}\n"
+        )
+
+    # ── Plots section ──────────────────────────────────────────────────────
+    plots_section = ""
+    if plot_links:
+        plot_lines = "\n".join(
+            md if md else f"[{name}]({url})"
+            for name, url, md in plot_links
+        )
+        plots_section = f"\n### Generated Plots\n\n{plot_lines}\n"
+
     return f"""## {verdict_icon} Pipeline Complete — {verdict}
 
 **Best Model:** `{algo}`
@@ -449,7 +574,7 @@ def _results_comment(
 ### Optimization History
 
 {history_table}
-
+{insights_section}{ml_recs_section}{validation_section}{plots_section}{token_section}
 ---
 
 **Summary:** {summary}
