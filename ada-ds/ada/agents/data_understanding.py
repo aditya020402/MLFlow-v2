@@ -80,6 +80,7 @@ Do NOT add any statement after the except block."""
 
 
 def preview_dataset_context(dataset_path: str, task_type: str, target_column: str = None) -> dict:
+    dataset_path = dataset_path.replace("\\", "/")
     try:
         import pandas as pd
         df_sample = pd.read_csv(dataset_path, nrows=1000)
@@ -154,6 +155,7 @@ def generate_understanding_code(
     target_column: str = None,
     dataset_context: dict = None,
 ) -> str:
+    dataset_path     = dataset_path.replace("\\", "/")
     dataset_context  = dataset_context or {}
     context_literal  = json.dumps(dataset_context, indent=4, default=str)
 
@@ -328,7 +330,7 @@ Fix it. Output ONLY the complete fixed Python code."""},
 
 def make_fix_callback(current_code_path: Path):
     def callback(stderr: str, stdout: str, attempt: int) -> str:
-        return fix_understanding_code(current_code_path.read_text(), stderr, stdout, attempt)
+        return fix_understanding_code(current_code_path.read_text(encoding="utf-8"), stderr, stdout, attempt)
     return callback
 
 

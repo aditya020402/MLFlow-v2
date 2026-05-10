@@ -133,11 +133,11 @@ def _append_log(log_path: Path, entry: dict) -> None:
         existing: list = []
         if log_path.exists():
             try:
-                existing = json.loads(log_path.read_text())
+                existing = json.loads(log_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 existing = []
         existing.append(entry)
-        log_path.write_text(json.dumps(existing, indent=2, default=str))
+        log_path.write_text(json.dumps(existing, indent=2, default=str), encoding="utf-8")
     except Exception as exc:
         logger.warning("Could not write log.json: %s", exc)
 

@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import shutil
+import warnings
 from pathlib import Path
 from typing import Any, Optional, TypedDict, Literal
 
@@ -24,6 +25,14 @@ from ada.agents.token_tracker import set_session as _set_session, get as _get_to
 from ada.tools.runner import run_script_with_retry, parse_metrics_from_output, get_primary_score
 
 logger = logging.getLogger(__name__)
+
+# Suppress LangGraph's pending deprecation warning about JsonPlusSerializer.allowed_objects
+# — the parameter is internal to SqliteSaver and cannot be passed by callers.
+warnings.filterwarnings(
+    "ignore",
+    message=".*allowed_objects.*",
+    category=DeprecationWarning,
+)
 
 MAX_RETRIES            = int(os.environ.get("MAX_RETRIES", "10"))
 MAX_OPTIMIZATION_LOOPS = int(os.environ.get("MAX_OPTIMIZATION_LOOPS", "3"))
@@ -414,7 +423,7 @@ def node_execute_ml(state: PipelineState) -> PipelineState:
     )
 
     if result.success:
-        working_code = (_paths.GENERATED_CODE_DIR / "step3_ml.py").read_text()
+        working_code = (_paths.GENERATED_CODE_DIR / "step3_ml.py").read_text(encoding="utf-8")
         events = _emit({"events": events}, "execution_success", "Baseline model trained.")
         return {**state, "ml_output": result.stdout, "ml_error": "",
                 "last_opt_working_code": working_code, "events": events}
@@ -569,7 +578,7 @@ def node_execute_optimization(state: PipelineState) -> PipelineState:
     )
 
     if result.success:
-        working_code = (_paths.GENERATED_CODE_DIR / script_name).read_text() if script_name else ""
+        working_code = (_paths.GENERATED_CODE_DIR / script_name).read_text(encoding="utf-8") if script_name else ""
         events = _emit({"events": events}, "execution_success", f"Iteration {iteration} succeeded.")
         return {**state, "opt_output": result.stdout, "opt_error": "",
                 "last_opt_working_code": working_code, "events": events}
@@ -613,7 +622,7 @@ def node_finalize_best(state: PipelineState) -> PipelineState:
         logger.warning("Best model path not found: %s", best_path)
 
     history_path = session_out / "optimization_history.json"
-    history_path.write_text(json.dumps(history, indent=2, default=str))
+    history_path.write_text(json.dumps(history, indent=2, default=str), encoding="utf-8")
 
     events = _emit(
         {"events": events}, "optimization_complete",

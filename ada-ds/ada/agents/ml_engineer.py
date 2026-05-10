@@ -26,16 +26,22 @@ Rules:
 - Metrics must be computed on the TEST set ONLY — never on training data.
 - Wrap the final metrics JSON in METRICS_JSON_START / METRICS_JSON_END markers.
 - Save the trained model with pickle to the exact path given.
-- MANDATORY: Immediately after saving the model, save the final feature column list:
+- MANDATORY: Save the feature column names BEFORE applying any scaler (fit_transform returns a numpy array
+  with no .columns). Use this exact pattern:
+    feature_names = list(X_train.columns)   # capture BEFORE scaling
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled  = scaler.transform(X_test)
+    # ... fit model on X_train_scaled, evaluate on X_test_scaled ...
     features_path = model_path.replace(".pkl", "_features.pkl")
-    pickle.dump(X_train.columns.tolist(), open(features_path, "wb"))
-  X_train must be the DataFrame AFTER all preprocessing (encoding, scaling, feature selection).
-  This is required so the validation/testing agent can align features correctly.
+    pickle.dump(feature_names, open(features_path, "wb"))
+  NEVER call X_train.columns after fit_transform — it is a numpy array at that point.
 - Include a self-check: reload the saved model, re-predict on test set, log a warning if results differ.
 - NEVER use mean_squared_error(..., squared=False) — the `squared` parameter was removed in scikit-learn 1.4.
   Always compute RMSE as: import numpy as np; rmse = float(np.sqrt(mean_squared_error(y_test, predictions)))
 - VarianceThreshold is in sklearn.feature_selection, NOT sklearn.preprocessing.
   Import it as: from sklearn.feature_selection import VarianceThreshold
+- SimpleImputer is in sklearn.impute, NOT sklearn.preprocessing.
+  Import it as: from sklearn.impute import SimpleImputer
 - XGBoost / LightGBM LABEL ENCODING: These models require numeric labels for classification.
   ALWAYS encode the target before fitting:
     from sklearn.preprocessing import LabelEncoder
@@ -45,6 +51,19 @@ Rules:
   Fit on y_train_enc and predict on y_test_enc.
   Convert predictions back for metrics: y_pred_labels = le.inverse_transform(predictions)
 - NEVER pass string labels directly to XGBClassifier, LGBMClassifier, or CatBoostClassifier.
+- NEVER use df.pop(col) AND ALSO df.drop(columns=[col]) — they are mutually exclusive.
+  To split features and target, use EXACTLY:
+    y = df[target_column]
+    X = df.drop(columns=[target_column])
+  NEVER call df.pop() for this purpose — it mutates df in-place, removing the column before drop() runs.
+- NEVER use inplace=True on a column slice — pandas 3.x Copy-on-Write raises ChainedAssignmentError.
+  WRONG: df[col].fillna(val, inplace=True)
+  RIGHT: df[col] = df[col].fillna(val)
+- NEVER use select_dtypes(include=['object']) — deprecated in pandas 3.x.
+  Use: cat_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
+- NEVER include 'normalize' in LinearRegression hyperparameter grids — removed in scikit-learn 1.0.
+  Valid LinearRegression params: fit_intercept, copy_X, n_jobs, positive, tol.
+- NEVER use pd.np — removed in pandas 2.0. Use numpy (np) directly.
 """
 
 FIX_SYSTEM_PROMPT = """You are an expert Python debugger. Fix the provided code based on the error.
@@ -52,17 +71,35 @@ Output ONLY the complete fixed Python code. No explanations, no markdown, no bac
 NEVER use mean_squared_error(..., squared=False) — removed in scikit-learn 1.4.
 Compute RMSE as: rmse = float(np.sqrt(mean_squared_error(y_test, predictions)))
 CRITICAL: If a target column is provided in the context, use that EXACT column name. NEVER hardcode 'target' as a column name. NEVER fall back to the last column — if the column is missing, raise a clear error naming the expected column.
-MANDATORY: After saving the model with pickle, always save the feature list:
-    features_path = model_path.replace(".pkl", "_features.pkl")
-    pickle.dump(X_train.columns.tolist(), open(features_path, "wb"))
+MANDATORY: Save feature names BEFORE scaling — fit_transform returns a numpy array with no .columns:
+    feature_names = list(X_train.columns)   # BEFORE scaler.fit_transform
+    X_train_scaled = scaler.fit_transform(X_train)
+    # ...
+    pickle.dump(feature_names, open(features_path, "wb"))
+AttributeError 'numpy.ndarray' has no attribute 'columns': X_train was converted to array by fit_transform.
+  Fix: add `feature_names = list(X_train.columns)` before the fit_transform call and use feature_names for pickle.dump.
 VarianceThreshold is in sklearn.feature_selection — fix any wrong import of it from sklearn.preprocessing.
+SimpleImputer is in sklearn.impute — fix: from sklearn.impute import SimpleImputer (not sklearn.preprocessing).
 XGBoost / LightGBM LABEL ENCODING FIX: If error mentions invalid classes or string labels, add:
     from sklearn.preprocessing import LabelEncoder
     le = LabelEncoder()
     y_train_enc = le.fit_transform(y_train)
     y_test_enc  = le.transform(y_test)
   Fit on y_train_enc, predict on y_test_enc, convert back: y_pred_labels = le.inverse_transform(predictions)
-  Use y_pred_labels for metrics. NEVER pass string labels directly to XGBClassifier or LGBMClassifier."""
+  Use y_pred_labels for metrics. NEVER pass string labels directly to XGBClassifier or LGBMClassifier.
+KeyError on target column (e.g., "['col'] not found in axis" or "target column not found"):
+  The column was removed by df.pop() before drop() ran. Fix: remove ANY df.pop(target_column) call and use:
+    y = df[target_column]
+    X = df.drop(columns=[target_column])
+  NEVER use df.pop() for splitting — it mutates df in-place and makes drop() fail.
+NEVER use inplace=True on column slices — use: df[col] = df[col].fillna(val)
+NEVER use select_dtypes(include=['object']) — use: cat_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
+NEVER include 'normalize' in LinearRegression param grids — removed in scikit-learn 1.0.
+NEVER use pd.np — removed in pandas 2.0. Use numpy directly.
+CLUSTERING TASK — KeyError on a column name when code tries `y = df['col']` or `df.drop(columns=['col'])`:
+  This is an unsupervised task. There is NO target column. Fix: remove ALL references to y, y_train, y_test.
+  Keep ONLY: X = df[numeric_cols]; X_train, X_test = train_test_split(X, test_size=0.2, random_state=42)
+  NEVER create a y variable for clustering."""
 
 ALGORITHM_SELECTION_PROMPT = """You are an ML algorithm selection expert.
 Respond ONLY with a JSON object — no markdown, no extra text:
@@ -354,12 +391,13 @@ def generate_ml_code(
     session_id: str = "",
     analysis_data: dict = None,
 ) -> str:
+    dataset_path = dataset_path.replace("\\", "/")
     algo = algorithm_info["algorithm"]
     hyperparams = json.dumps(algorithm_info.get("hyperparameters", {}))
     reason = algorithm_info.get("reason", "")
     session_out = _paths.OUTPUTS_DIR / (session_id if session_id else "default")
     session_out.mkdir(parents=True, exist_ok=True)
-    model_path = str(session_out / "model_iter0.pkl")
+    model_path = str(session_out / "model_iter0.pkl").replace("\\", "/")
     is_cluster = not ("classif" in task_type or "regress" in task_type)
     stratify = "stratify=y, " if "classif" in task_type else ""
 
@@ -520,7 +558,7 @@ def make_fix_callback(
     target_column: str = "",
 ):
     def callback(stderr: str, stdout: str, attempt: int) -> str:
-        current_code = current_code_path.read_text()
+        current_code = current_code_path.read_text(encoding="utf-8")
         return fix_ml_code(
             current_code, stderr, stdout, attempt,
             dataset_path=dataset_path,

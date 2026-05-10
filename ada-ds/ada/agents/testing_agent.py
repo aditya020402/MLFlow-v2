@@ -205,15 +205,10 @@ Task type:     {task_type}
    {"y_pred = model.fit_predict(X)  # clustering: ALWAYS use fit_predict — DBSCAN/AgglomerativeClustering have no predict()" if is_cluster else "y_pred = model.predict(X)"}
    y_pred = pd.Series(y_pred).reset_index(drop=True)
 
-5. {"Compute metrics (ONLY if target column present in test CSV):" if has_target else "No supervised metrics — clustering only."}
-   {"y_actual = df_test['" + target_column + "'] if y_actual_exists else None" if has_target else ""}
-   {"has_actual = y_actual_exists" if has_target else "has_actual = False"}
-   if has_actual:
-       y_actual = y_actual.reset_index(drop=True)
-       {metrics_block}
-   else:
-       metrics = {{}}
-       summary = {{"total": len(y_pred)}}
+5. {"Compute metrics (supervised — use actual labels if present):" if has_target else "Compute clustering metrics — silhouette_score needs only X and labels, no ground truth required:"}
+   {(
+    "y_actual = df_test['" + target_column + "'] if y_actual_exists else None\n   has_actual = y_actual_exists\n   if has_actual:\n       y_actual = y_actual.reset_index(drop=True)\n       " + metrics_block + "\n   else:\n       metrics = {}\n       summary = {'total': len(y_pred)}"
+   ) if has_target else metrics_block}
 
 6. Build per-row records (use X with its original column values for display):
    records = []
@@ -335,7 +330,7 @@ def run(
     logger.info("Written: %s", script_path)
 
     def _fix_callback(stderr: str, stdout: str, attempt: int) -> str:
-        return fix_test_code(script_path.read_text(), stderr, stdout, attempt)
+        return fix_test_code(script_path.read_text(encoding="utf-8"), stderr, stdout, attempt)
 
     result = run_script_with_retry(
         script_name,

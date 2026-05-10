@@ -31,9 +31,17 @@ Rules:
   WRONG: df[col].fillna(val, inplace=True)
   RIGHT: df[col] = df[col].fillna(val)
 - NEVER use pd.np — removed in pandas 2.0. Always use numpy directly.
-- AVOID "Maximum recursion level reached": do NOT use df.apply() with lambdas that call back on df,
-  and do NOT use comparison operators (==, !=) on whole DataFrames with object columns.
-  To compare a column, use: df[col] == value  (single column only, not the whole DataFrame).
+- NEVER use df.apply() — it triggers "Maximum recursion level reached" on DataFrames with object/string columns.
+  WRONG: df.apply(lambda col: col.fillna(col.mode()[0]), axis=0)
+  WRONG: df.apply(lambda row: ..., axis=1)
+  RIGHT: use explicit for loops:
+    for col in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = df[col].fillna(df[col].mode()[0])
+        else:
+            df[col] = df[col].fillna(df[col].median())
+- NEVER use comparison operators (==, !=) on whole DataFrames with object columns.
+  To compare a column, use: df[col] == value  (single column only, never df == value).
 - For df.corr(), always pass numeric_only=True to avoid errors on non-numeric columns.
 - Use EXACTLY this try/except structure — nothing outside it:
 
@@ -60,10 +68,16 @@ NEVER use np.issubdtype(col.dtype, np.number) — use pd.api.types.is_numeric_dt
 NEVER use select_dtypes(include=['object']) — use: cat_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
 NEVER use inplace=True on a column slice — use: df[col] = df[col].fillna(val)
 For df.corr(), always pass numeric_only=True.
-"Maximum recursion level reached" FIX: Replace any df.apply() with lambda that references df,
-and any whole-DataFrame comparison (df == value). Use per-column operations instead:
-  for col in df.columns: df[col] = df[col].fillna(...)
-  Use df[col] == value, never df == value.
+"Maximum recursion level reached" FIX: Remove ALL df.apply() calls — they always cause this error on
+DataFrames with object/string columns. Replace with explicit for loops:
+  WRONG: df.apply(lambda col: col.fillna(col.mode()[0]), axis=0)
+  RIGHT:
+    for col in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = df[col].fillna(df[col].mode()[0])
+        else:
+            df[col] = df[col].fillna(df[col].median())
+Also remove any whole-DataFrame comparison (df == value) — use df[col] == value per column.
 KeyError on column name: the column may have been renamed or dropped earlier. Use df.columns.tolist()
 to check available columns before accessing. Use df.get(col) or check 'col in df.columns' first.
 The output structure MUST follow this EXACT pattern — both prints inside try, nothing after except:
@@ -89,8 +103,9 @@ def generate_analysis_code(
     session_id: str = "",
 ) -> str:
     session_key  = session_id or "default"
-    plots_dir    = str(_paths.OUTPUTS_DIR / session_key / "plots")
-    cleaned_path = str(_paths.UPLOADS_DIR / f"{session_key}_cleaned.csv")
+    plots_dir    = str(_paths.OUTPUTS_DIR / session_key / "plots").replace("\\", "/")
+    cleaned_path = str(_paths.UPLOADS_DIR / f"{session_key}_cleaned.csv").replace("\\", "/")
+    dataset_path = dataset_path.replace("\\", "/")
 
     prompt = f"""Write Python code to clean a dataset and produce an analysis report.
 
@@ -205,7 +220,7 @@ Fix it. Output ONLY the complete fixed Python code."""},
 
 def make_fix_callback(current_code_path: Path):
     def callback(stderr: str, stdout: str, attempt: int) -> str:
-        return fix_analysis_code(current_code_path.read_text(), stderr, stdout, attempt)
+        return fix_analysis_code(current_code_path.read_text(encoding="utf-8"), stderr, stdout, attempt)
     return callback
 
 

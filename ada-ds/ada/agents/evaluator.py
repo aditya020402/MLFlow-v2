@@ -97,5 +97,5 @@ def _save_evaluation(evaluation: dict, algorithm: str, task_type: str):
     _paths.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = _paths.OUTPUTS_DIR / "evaluation.json"
     full = {"algorithm": algorithm, "task_type": task_type, **evaluation}
-    out_path.write_text(json.dumps(full, indent=2))
+    out_path.write_text(json.dumps(full, indent=2), encoding="utf-8")
     logger.info("Evaluation saved to %s", out_path)

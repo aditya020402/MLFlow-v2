@@ -180,6 +180,7 @@ def generate_task_profiling_code(
     target_column: str | None,
     general_output: str,
 ) -> str:
+    dataset_path = dataset_path.replace("\\", "/")
     is_classif = "classif" in task_type
     is_regress = "regress" in task_type
 
@@ -265,7 +266,7 @@ Fix it. Output ONLY the complete fixed Python code."""},
 
 def make_fix_callback(current_code_path: Path):
     def callback(stderr: str, stdout: str, attempt: int) -> str:
-        return fix_profiling_code(current_code_path.read_text(), stderr, stdout, attempt)
+        return fix_profiling_code(current_code_path.read_text(encoding="utf-8"), stderr, stdout, attempt)
     return callback
 
 

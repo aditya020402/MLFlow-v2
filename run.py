@@ -1,7 +1,7 @@
 from ada import run_pipeline
 
 result = run_pipeline(
-    dataset=r"C:\Users\shubh\Downloads\vscode\MLFlow-v2\gender_classification_v7.csv",
+    dataset=r"C:\Users\shubh\Downloads\vscode\MLFlow-v2\Ship_Performance_Dataset.csv",
     instructions=r"C:\Users\shubh\Downloads\vscode\MLFlow-v2\instructions.md",
     output_dir="./ada_output",
     env_file=r"C:\Users\shubh\Downloads\vscode\MLFlow-v2\.env"
